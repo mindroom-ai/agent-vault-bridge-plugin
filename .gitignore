@@ -1,0 +1,7 @@
+.ruff_cache/
+.claude/
+.coverage
+coverage.xml
+__pycache__/
+.pytest_cache/
+*.pyc

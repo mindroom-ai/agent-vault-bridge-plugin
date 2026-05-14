@@ -1,0 +1,45 @@
+#!/usr/bin/env sh
+set -eu
+
+self_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+find_real() {
+  name="$1"
+  old_ifs="$IFS"
+  IFS=:
+  for dir in $PATH; do
+    IFS="$old_ifs"
+    [ -n "$dir" ] || continue
+    [ "$dir" = "$self_dir" ] && continue
+    if [ -x "$dir/$name" ]; then
+      printf '%s\n' "$dir/$name"
+      return 0
+    fi
+    IFS=:
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+curl_bin="$(find_real curl)"
+targeted=0
+for arg in "$@"; do
+  case "$arg" in
+    *api.github.com*) targeted=1 ;;
+  esac
+done
+
+if [ "$targeted" != "1" ] || [ -z "${AGENT_VAULT_PROXY_TOKEN:-}" ]; then
+  exec "$curl_bin" "$@"
+fi
+
+ca_path="${AGENT_VAULT_CA_PATH:-/etc/ssl/agent-vault-ca.pem}"
+proxy="${HTTPS_PROXY:-https://127.0.0.1:14322}"
+
+exec "$curl_bin" \
+  --proxy "$proxy" \
+  --proxy-cacert "$ca_path" \
+  --proxy-insecure \
+  --cacert "$ca_path" \
+  --proxy-header "Proxy-Authorization: Bearer $AGENT_VAULT_PROXY_TOKEN" \
+  "$@"
