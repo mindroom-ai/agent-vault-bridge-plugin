@@ -1,0 +1,79 @@
+services:
+  upstream:
+    image: python:3.13-alpine
+    working_dir: /app
+    command:
+      - python
+      - -m
+      - local.broker_smoke.servers
+      - upstream
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    volumes:
+      - ../..:/app:ro
+    networks:
+      - egress_net
+
+  fake-agent-vault:
+    image: python:3.13-alpine
+    working_dir: /app
+    command:
+      - python
+      - -m
+      - local.broker_smoke.servers
+      - fake-agent-vault
+      - --host
+      - 0.0.0.0
+      - --port
+      - "18081"
+      - --required-proxy-token
+      - adapter-session
+      - --injected-authorization
+      - "Bearer fake-secret"
+    volumes:
+      - ../..:/app:ro
+    networks:
+      - egress_net
+
+  adapter:
+    image: python:3.13-alpine
+    working_dir: /app
+    command:
+      - python
+      - -m
+      - local.broker_smoke.servers
+      - adapter
+      - --host
+      - 0.0.0.0
+      - --port
+      - "18080"
+      - --upstream-proxy-url
+      - http://fake-agent-vault:18081
+      - --session-token
+      - adapter-session
+    volumes:
+      - ../..:/app:ro
+    networks:
+      - worker_net
+      - egress_net
+
+  runner:
+    image: python:3.13-alpine
+    working_dir: /app
+    command: ["sleep", "infinity"]
+    environment:
+      HTTP_PROXY: http://adapter:18080
+      HTTPS_PROXY: http://adapter:18080
+      http_proxy: http://adapter:18080
+      https_proxy: http://adapter:18080
+    volumes:
+      - ../..:/app:ro
+    networks:
+      - worker_net
+
+networks:
+  worker_net:
+    internal: true
+  egress_net:
