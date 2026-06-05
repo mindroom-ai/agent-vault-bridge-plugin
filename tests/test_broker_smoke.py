@@ -91,3 +91,50 @@ def test_adapter_forwards_connect_proxy_authorization() -> None:
 
     assert response.startswith(b"HTTP/1.0 200")
     assert seen_headers["proxy-authorization"] == "Bearer adapter-session"
+
+
+def test_adapter_dechunks_post_body_before_forwarding_to_agent_vault() -> None:
+    seen: dict[str, object] = {}
+
+    class ChunkedProxyHandler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            seen["body"] = body
+            seen["headers"] = {key.lower(): value for key, value in self.headers.items()}
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, _format: str, *_args: object) -> None:
+            return
+
+    fake_proxy = ThreadingHTTPServer(("127.0.0.1", 0), ChunkedProxyHandler)
+    fake_proxy_thread = threading.Thread(target=fake_proxy.serve_forever, daemon=True)
+    fake_proxy_thread.start()
+    upstream_proxy_url = f"http://127.0.0.1:{fake_proxy.server_address[1]}"
+
+    try:
+        with start_adapter(upstream_proxy_url=upstream_proxy_url, session_token="adapter-session") as adapter:
+            with socket.create_connection((adapter.host, adapter.port), timeout=5) as client:
+                client.sendall(
+                    b"POST http://example.invalid/upload HTTP/1.1\r\n"
+                    b"Host: example.invalid\r\n"
+                    b"Transfer-Encoding: chunked\r\n"
+                    b"\r\n"
+                    b"5\r\nhello\r\n"
+                    b"6\r\n world\r\n"
+                    b"0\r\n\r\n",
+                )
+                response = client.recv(1024)
+    finally:
+        fake_proxy.shutdown()
+        fake_proxy.server_close()
+        fake_proxy_thread.join(timeout=5)
+
+    headers = seen["headers"]
+    assert isinstance(headers, dict)
+    assert response.startswith(b"HTTP/1.0 200")
+    assert seen["body"] == b"hello world"
+    assert headers["content-length"] == "11"
+    assert "transfer-encoding" not in headers
+    assert headers["proxy-authorization"] == "Bearer adapter-session"

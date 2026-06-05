@@ -4,6 +4,7 @@ import argparse
 import http.client
 import json
 import threading
+from collections.abc import Iterable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Self
@@ -143,6 +144,8 @@ def _forward_to_proxy(
         connection.request(handler.command, handler.path, headers=headers)
         response = connection.getresponse()
         _copy_response(handler, response)
+    except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        handler.send_error(502, f"Bad Gateway: {exc}")
     finally:
         connection.close()
 
@@ -170,12 +173,14 @@ def _forward_absolute_proxy_request(
         connection.request(handler.command, target_path, headers=headers)
         response = connection.getresponse()
         _copy_response(handler, response)
+    except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        handler.send_error(502, f"Bad Gateway: {exc}")
     finally:
         connection.close()
 
 
 def _forward_headers(
-    items: object,
+    items: Iterable[tuple[str, str]],
     *,
     add_headers: dict[str, str],
 ) -> dict[str, str]:
@@ -183,7 +188,10 @@ def _forward_headers(
     for key, value in items:
         if key.lower() in _HOP_BY_HOP_HEADERS:
             continue
-        headers[key] = value
+        if key in headers:
+            headers[key] = f"{headers[key]}, {value}"
+        else:
+            headers[key] = value
     headers.update(add_headers)
     return headers
 

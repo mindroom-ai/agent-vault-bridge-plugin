@@ -196,7 +196,7 @@ plugins:
   - path: plugins/agent-vault-bridge
     settings:
       mode: legacy_shim
-      vault_proxy: http://agent-vault:14322
+      vault_proxy: https://agent-vault:14322
       ca_path: /etc/ssl/agent-vault-ca.pem
       brokered_hosts: [api.github.com]
       gated_tools: [shell]

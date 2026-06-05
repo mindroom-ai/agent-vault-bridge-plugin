@@ -142,13 +142,21 @@ def _forward_http_request(
     proxy_port: int,
     proxy_authorization: str,
 ) -> None:
-    body = _read_request_body(handler)
+    try:
+        body = _read_request_body(handler)
+    except ValueError as exc:
+        handler.send_error(400, str(exc))
+        return
     headers = _forward_headers(handler.headers.items(), proxy_authorization=proxy_authorization)
+    if body is not None:
+        headers["Content-Length"] = str(len(body))
     connection = http.client.HTTPConnection(proxy_host, proxy_port, timeout=10)
     try:
         connection.request(handler.command, handler.path, body=body, headers=headers)
         response = connection.getresponse()
         _copy_response(handler, response)
+    except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        handler.send_error(502, f"Bad Gateway: {exc}")
     finally:
         connection.close()
 
@@ -181,11 +189,17 @@ def _forward_connect(
         if upstream_sock is None:
             return
         _tunnel_sockets(handler.connection, upstream_sock)
+    except (OSError, TimeoutError, http.client.HTTPException) as exc:
+        handler.send_error(502, f"Bad Gateway: {exc}")
     finally:
         connection.close()
 
 
 def _read_request_body(handler: BaseHTTPRequestHandler) -> bytes | None:
+    transfer_encoding = handler.headers.get("Transfer-Encoding", "")
+    if "chunked" in transfer_encoding.lower():
+        return _read_chunked_request_body(handler)
+
     raw_length = handler.headers.get("Content-Length")
     if raw_length is None:
         return None
@@ -196,6 +210,41 @@ def _read_request_body(handler: BaseHTTPRequestHandler) -> bytes | None:
     if length <= 0:
         return None
     return handler.rfile.read(length)
+
+
+def _read_chunked_request_body(handler: BaseHTTPRequestHandler) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        size_line = handler.rfile.readline()
+        if not size_line:
+            msg = "Malformed chunked request body"
+            raise ValueError(msg)
+        raw_size = size_line.split(b";", 1)[0].strip()
+        try:
+            size = int(raw_size, 16)
+        except ValueError as exc:
+            msg = "Malformed chunked request body"
+            raise ValueError(msg) from exc
+        if size == 0:
+            _drain_chunked_trailers(handler)
+            return b"".join(chunks)
+
+        chunk = handler.rfile.read(size)
+        if len(chunk) != size:
+            msg = "Incomplete chunked request body"
+            raise ValueError(msg)
+        chunks.append(chunk)
+        terminator = handler.rfile.read(2)
+        if terminator != b"\r\n":
+            msg = "Malformed chunked request body"
+            raise ValueError(msg)
+
+
+def _drain_chunked_trailers(handler: BaseHTTPRequestHandler) -> None:
+    while True:
+        line = handler.rfile.readline()
+        if line in {b"", b"\n", b"\r\n"}:
+            return
 
 
 def _forward_headers(
