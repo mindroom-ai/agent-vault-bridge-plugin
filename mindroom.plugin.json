@@ -1,5 +1,4 @@
 {
   "name": "agent-vault-bridge",
-  "hooks_module": "hooks.py",
   "skills": []
 }

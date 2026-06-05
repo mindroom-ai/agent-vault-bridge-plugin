@@ -7,17 +7,11 @@ import http.client
 import select
 import socket
 import threading
-import time
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Self
 from urllib.parse import urlsplit
-
-try:
-    from .vault_client import BootstrapSettings, SessionToken, VaultSettings, mint_proxy_session_token
-except ImportError:  # pragma: no cover - supports `python -m adapter` from repo root
-    from vault_client import BootstrapSettings, SessionToken, VaultSettings, mint_proxy_session_token
 
 _HOP_BY_HOP_HEADERS = {
     "connection",
@@ -69,14 +63,13 @@ class _QuietHandler(BaseHTTPRequestHandler):
 def start_adapter(
     *,
     upstream_proxy_url: str,
-    session_token: str | None = None,
-    session_token_provider: Callable[[], str] | None = None,
+    session_token: str,
     host: str = "127.0.0.1",
     port: int = 0,
 ) -> RunningAdapter:
     """Start an HTTP proxy that injects Proxy-Authorization upstream."""
-    if session_token is None and session_token_provider is None:
-        msg = "session_token or session_token_provider is required"
+    if not session_token:
+        msg = "session_token is required"
         raise ValueError(msg)
     upstream = urlsplit(upstream_proxy_url)
     if upstream.scheme != "http" or not upstream.hostname:
@@ -85,11 +78,7 @@ def start_adapter(
     upstream_port = upstream.port or 80
 
     def proxy_authorization() -> str:
-        token = session_token_provider() if session_token_provider is not None else session_token
-        if not token:
-            msg = "Agent Vault adapter session token is empty"
-            raise RuntimeError(msg)
-        return f"Bearer {token}"
+        return f"Bearer {session_token}"
 
     class AgentVaultAdapterHandler(_QuietHandler):
         def do_CONNECT(self) -> None:  # noqa: N802
@@ -302,10 +291,7 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=18080)
     parser.add_argument("--upstream-proxy-url", required=True)
-    parser.add_argument("--session-token")
-    parser.add_argument("--bootstrap-method", default="docker_exec")
-    parser.add_argument("--bootstrap-container", default="agent-vault")
-    parser.add_argument("--session-ttl-seconds", type=int, default=86400)
+    parser.add_argument("--session-token", required=True)
     args = parser.parse_args()
 
     with start_adapter(
@@ -313,30 +299,8 @@ def main() -> None:
         port=args.port,
         upstream_proxy_url=args.upstream_proxy_url,
         session_token=args.session_token,
-        session_token_provider=None if args.session_token else _session_token_provider_from_args(args),
     ) as adapter:
         adapter.thread.join()
-
-
-def _session_token_provider_from_args(args: argparse.Namespace) -> Callable[[], str]:
-    settings = VaultSettings(
-        vault_proxy=args.upstream_proxy_url,
-        session_ttl_seconds=args.session_ttl_seconds,
-        bootstrap=BootstrapSettings(
-            method=args.bootstrap_method,
-            container=args.bootstrap_container,
-        ),
-    )
-    cached: SessionToken | None = None
-
-    def provide_session_token() -> str:
-        nonlocal cached
-        now = time.time()
-        if cached is None or not cached.is_valid(now + 60):
-            cached = mint_proxy_session_token(settings, now=now)
-        return cached.value
-
-    return provide_session_token
 
 
 if __name__ == "__main__":

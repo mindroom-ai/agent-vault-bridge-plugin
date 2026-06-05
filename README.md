@@ -25,8 +25,6 @@ There is no command-line URL matching. If a URL is hidden inside a bash script, 
 |-----------|---------|
 | `adapter.py` | Small forward-proxy adapter that adds the Agent Vault proxy session header. Supports normal proxy requests and `CONNECT`. |
 | `local/broker_smoke/` | Docker smoke harness with fake Agent Vault and fake upstream. |
-| `hooks.py` | Legacy URL-matching shim mode for old MindRoom versions. Disabled by default. |
-| `bin/gh`, `bin/curl` | Legacy shims used only by `mode: legacy_shim`. |
 
 ## MindRoom Config
 
@@ -54,8 +52,6 @@ Disable the inherited broker for one agent with `worker_egress_broker: false`.
 
 ## Adapter
 
-Static token mode:
-
 ```bash
 python -m adapter \
   --host 0.0.0.0 \
@@ -64,19 +60,7 @@ python -m adapter \
   --session-token "$AGENT_VAULT_PROXY_SESSION_TOKEN"
 ```
 
-Docker bootstrap mode:
-
-```bash
-python -m adapter \
-  --host 0.0.0.0 \
-  --port 18080 \
-  --upstream-proxy-url http://agent-vault:14322 \
-  --bootstrap-method docker_exec \
-  --bootstrap-container agent-vault \
-  --session-ttl-seconds 86400
-```
-
-`docker_exec` requires Docker CLI access from the adapter container or host. In Kubernetes, prefer a projected session-token secret or a future Agent Vault API/bootstrap flow.
+Provide `AGENT_VAULT_PROXY_SESSION_TOKEN` through your process manager, Docker secret, or Kubernetes Secret. Token minting stays outside this adapter.
 
 ## Docker
 
@@ -163,7 +147,7 @@ worker_egress_brokers:
     no_proxy: localhost,127.0.0.1,.svc,.cluster.local
 ```
 
-For production Kubernetes, avoid `docker_exec`. Give the adapter a short-lived session token through a Secret, or add an Agent Vault bootstrap endpoint/service account flow and use that as the token provider.
+For production Kubernetes, give the adapter a short-lived session token through a Secret and rotate it outside this process.
 
 ## Local Validation
 
@@ -186,23 +170,3 @@ The smoke starts a runner, adapter, fake Agent Vault, and fake upstream. It vali
 - `Proxy-Authorization` does not reach upstream
 - runner env does not contain broker or service tokens
 - direct runner egress fails when proxy env is removed
-
-## Legacy Shim Mode
-
-Older MindRoom builds can opt into the previous hook/shim path:
-
-```yaml
-plugins:
-  - path: plugins/agent-vault-bridge
-    settings:
-      mode: legacy_shim
-      vault_proxy: https://agent-vault:14322
-      ca_path: /etc/ssl/agent-vault-ca.pem
-      brokered_hosts: [api.github.com]
-      gated_tools: [shell]
-      bootstrap:
-        method: docker_exec
-        container: agent-vault
-```
-
-Legacy mode is less robust because it detects configured hosts in the tool call and monkey-patches MindRoom internals. Prefer native `worker_egress_brokers` when available.
