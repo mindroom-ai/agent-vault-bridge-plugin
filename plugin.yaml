@@ -1,6 +1,7 @@
 name: agent-vault-bridge
 enabled: true
 settings:
+  mode: native_worker_egress
   vault_api: http://127.0.0.1:14321
   vault_proxy: https://127.0.0.1:14322
   ca_path: /etc/ssl/agent-vault-ca.pem

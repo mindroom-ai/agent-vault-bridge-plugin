@@ -1,0 +1,294 @@
+"""Forward proxy adapter that hides Agent Vault proxy sessions from workers."""
+
+from __future__ import annotations
+
+import argparse
+import http.client
+import select
+import socket
+import threading
+import time
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Self
+from urllib.parse import urlsplit
+
+try:
+    from .vault_client import BootstrapSettings, SessionToken, VaultSettings, mint_proxy_session_token
+except ImportError:  # pragma: no cover - supports `python -m adapter` from repo root
+    from vault_client import BootstrapSettings, SessionToken, VaultSettings, mint_proxy_session_token
+
+_HOP_BY_HOP_HEADERS = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+}
+_TUNNEL_BUFFER_BYTES = 64 * 1024
+_TUNNEL_IDLE_TIMEOUT_SECONDS = 30
+
+
+@dataclass(slots=True)
+class RunningAdapter:
+    """Started adapter server handle."""
+
+    httpd: ThreadingHTTPServer
+    thread: threading.Thread
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.httpd.shutdown()
+        self.httpd.server_close()
+        self.thread.join(timeout=5)
+
+    @property
+    def host(self) -> str:
+        return str(self.httpd.server_address[0])
+
+    @property
+    def port(self) -> int:
+        return int(self.httpd.server_address[1])
+
+    @property
+    def proxy_url(self) -> str:
+        return f"http://{self.host}:{self.port}"
+
+
+class _QuietHandler(BaseHTTPRequestHandler):
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+def start_adapter(
+    *,
+    upstream_proxy_url: str,
+    session_token: str | None = None,
+    session_token_provider: Callable[[], str] | None = None,
+    host: str = "127.0.0.1",
+    port: int = 0,
+) -> RunningAdapter:
+    """Start an HTTP proxy that injects Proxy-Authorization upstream."""
+    if session_token is None and session_token_provider is None:
+        msg = "session_token or session_token_provider is required"
+        raise ValueError(msg)
+    upstream = urlsplit(upstream_proxy_url)
+    if upstream.scheme != "http" or not upstream.hostname:
+        msg = "upstream_proxy_url must be an http://host:port URL"
+        raise ValueError(msg)
+    upstream_port = upstream.port or 80
+
+    def proxy_authorization() -> str:
+        token = session_token_provider() if session_token_provider is not None else session_token
+        if not token:
+            msg = "Agent Vault adapter session token is empty"
+            raise RuntimeError(msg)
+        return f"Bearer {token}"
+
+    class AgentVaultAdapterHandler(_QuietHandler):
+        def do_CONNECT(self) -> None:  # noqa: N802
+            _forward_connect(
+                self,
+                proxy_host=upstream.hostname or "",
+                proxy_port=upstream_port,
+                proxy_authorization=proxy_authorization(),
+            )
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            self._forward_request()
+
+        def do_GET(self) -> None:  # noqa: N802
+            self._forward_request()
+
+        def do_HEAD(self) -> None:  # noqa: N802
+            self._forward_request()
+
+        def do_OPTIONS(self) -> None:  # noqa: N802
+            self._forward_request()
+
+        def do_PATCH(self) -> None:  # noqa: N802
+            self._forward_request()
+
+        def do_POST(self) -> None:  # noqa: N802
+            self._forward_request()
+
+        def do_PUT(self) -> None:  # noqa: N802
+            self._forward_request()
+
+        def _forward_request(self) -> None:
+            _forward_http_request(
+                self,
+                proxy_host=upstream.hostname or "",
+                proxy_port=upstream_port,
+                proxy_authorization=proxy_authorization(),
+            )
+
+    httpd = ThreadingHTTPServer((host, port), AgentVaultAdapterHandler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    return RunningAdapter(httpd=httpd, thread=thread)
+
+
+def _forward_http_request(
+    handler: BaseHTTPRequestHandler,
+    *,
+    proxy_host: str,
+    proxy_port: int,
+    proxy_authorization: str,
+) -> None:
+    body = _read_request_body(handler)
+    headers = _forward_headers(handler.headers.items(), proxy_authorization=proxy_authorization)
+    connection = http.client.HTTPConnection(proxy_host, proxy_port, timeout=10)
+    try:
+        connection.request(handler.command, handler.path, body=body, headers=headers)
+        response = connection.getresponse()
+        _copy_response(handler, response)
+    finally:
+        connection.close()
+
+
+def _forward_connect(
+    handler: BaseHTTPRequestHandler,
+    *,
+    proxy_host: str,
+    proxy_port: int,
+    proxy_authorization: str,
+) -> None:
+    connection = http.client.HTTPConnection(proxy_host, proxy_port, timeout=10)
+    try:
+        connection.request(
+            "CONNECT",
+            handler.path,
+            headers={
+                "Host": handler.path,
+                "Proxy-Authorization": proxy_authorization,
+            },
+        )
+        response = connection.getresponse()
+        if response.status != 200:
+            _copy_response(handler, response)
+            return
+
+        handler.send_response(200, response.reason)
+        handler.end_headers()
+        upstream_sock = connection.sock
+        if upstream_sock is None:
+            return
+        _tunnel_sockets(handler.connection, upstream_sock)
+    finally:
+        connection.close()
+
+
+def _read_request_body(handler: BaseHTTPRequestHandler) -> bytes | None:
+    raw_length = handler.headers.get("Content-Length")
+    if raw_length is None:
+        return None
+    try:
+        length = int(raw_length)
+    except ValueError:
+        return None
+    if length <= 0:
+        return None
+    return handler.rfile.read(length)
+
+
+def _forward_headers(
+    items: Iterable[tuple[str, str]],
+    *,
+    proxy_authorization: str,
+) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for key, value in items:
+        if key.lower() in _HOP_BY_HOP_HEADERS:
+            continue
+        headers[key] = value
+    headers["Proxy-Authorization"] = proxy_authorization
+    return headers
+
+
+def _copy_response(handler: BaseHTTPRequestHandler, response: http.client.HTTPResponse) -> None:
+    body = response.read()
+    handler.send_response(response.status, response.reason)
+    for key, value in response.getheaders():
+        if key.lower() in _HOP_BY_HOP_HEADERS:
+            continue
+        handler.send_header(key, value)
+    handler.end_headers()
+    if body:
+        handler.wfile.write(body)
+
+
+def _tunnel_sockets(client_sock: socket.socket, upstream_sock: socket.socket) -> None:
+    sockets = [client_sock, upstream_sock]
+    for sock in sockets:
+        sock.setblocking(False)
+
+    while sockets:
+        readable, _, errored = select.select(sockets, [], sockets, _TUNNEL_IDLE_TIMEOUT_SECONDS)
+        if errored or not readable:
+            return
+        for source in readable:
+            target = upstream_sock if source is client_sock else client_sock
+            try:
+                chunk = source.recv(_TUNNEL_BUFFER_BYTES)
+            except OSError:
+                return
+            if not chunk:
+                return
+            try:
+                target.sendall(chunk)
+            except OSError:
+                return
+
+
+def main() -> None:
+    """Run the adapter process."""
+    parser = argparse.ArgumentParser(description="Run Agent Vault forward proxy adapter.")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=18080)
+    parser.add_argument("--upstream-proxy-url", required=True)
+    parser.add_argument("--session-token")
+    parser.add_argument("--bootstrap-method", default="docker_exec")
+    parser.add_argument("--bootstrap-container", default="agent-vault")
+    parser.add_argument("--session-ttl-seconds", type=int, default=86400)
+    args = parser.parse_args()
+
+    with start_adapter(
+        host=args.host,
+        port=args.port,
+        upstream_proxy_url=args.upstream_proxy_url,
+        session_token=args.session_token,
+        session_token_provider=None if args.session_token else _session_token_provider_from_args(args),
+    ) as adapter:
+        adapter.thread.join()
+
+
+def _session_token_provider_from_args(args: argparse.Namespace) -> Callable[[], str]:
+    settings = VaultSettings(
+        vault_proxy=args.upstream_proxy_url,
+        session_ttl_seconds=args.session_ttl_seconds,
+        bootstrap=BootstrapSettings(
+            method=args.bootstrap_method,
+            container=args.bootstrap_container,
+        ),
+    )
+    cached: SessionToken | None = None
+
+    def provide_session_token() -> str:
+        nonlocal cached
+        now = time.time()
+        if cached is None or not cached.is_valid(now + 60):
+            cached = mint_proxy_session_token(settings, now=now)
+        return cached.value
+
+    return provide_session_token
+
+
+if __name__ == "__main__":
+    main()

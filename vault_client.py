@@ -19,6 +19,7 @@ class BootstrapSettings:
 class VaultSettings:
     """Agent Vault connection and session settings."""
 
+    mode: str = "native_worker_egress"
     vault_api: str = "http://127.0.0.1:14321"
     vault_proxy: str = "https://127.0.0.1:14322"
     ca_path: str = "/etc/ssl/agent-vault-ca.pem"

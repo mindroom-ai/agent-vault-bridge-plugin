@@ -43,7 +43,6 @@ services:
     command:
       - python
       - -m
-      - local.broker_smoke.servers
       - adapter
       - --host
       - 0.0.0.0

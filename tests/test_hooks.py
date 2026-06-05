@@ -1,4 +1,4 @@
-# ruff: noqa: SLF001
+# ruff: noqa: E402, SLF001
 """Tests for the agent-vault-bridge plugin hooks."""
 
 from __future__ import annotations
@@ -26,6 +26,10 @@ from agent_vault_bridge_test_import.vault_client import SessionToken
 
 def _settings() -> hooks.VaultSettings:
     return hooks.VaultSettings(session_ttl_seconds=600)
+
+
+def _legacy_settings() -> dict[str, object]:
+    return {"mode": "legacy_shim"}
 
 
 def _seed_token(monkeypatch: pytest.MonkeyPatch, value: str = "session-token") -> None:
@@ -97,7 +101,7 @@ async def test_before_hook_marks_brokered_call_for_audit(monkeypatch: pytest.Mon
     ctx = SimpleNamespace(
         tool_name="run_shell_command",
         arguments={"args": ["gh", "api", "/user"], "GITHUB_TOKEN": "secret"},
-        settings={},
+        settings=_legacy_settings(),
         correlation_id="call-1",
         decline=MagicMock(),
     )
@@ -108,6 +112,24 @@ async def test_before_hook_marks_brokered_call_for_audit(monkeypatch: pytest.Mon
     assert ctx.arguments[hooks.AUDIT_ROUTED_ARGUMENT] is True
     assert hooks._audit_host_by_correlation["call-1"] == "api.github.com"
     assert "GITHUB_TOKEN" not in ctx.arguments
+    ctx.decline.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_before_hook_is_noop_in_native_worker_egress_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    _seed_token(monkeypatch)
+    ctx = SimpleNamespace(
+        tool_name="run_shell_command",
+        arguments={"args": ["gh", "api", "/user"], "GITHUB_TOKEN": "secret"},
+        settings={},
+        correlation_id="call-native",
+        decline=MagicMock(),
+    )
+
+    await hooks.prepare_brokered_tool_call(ctx)
+
+    assert hooks.AUDIT_HOST_ARGUMENT not in ctx.arguments
+    assert ctx.arguments["GITHUB_TOKEN"] == "secret"
     ctx.decline.assert_not_called()
 
 
@@ -146,6 +168,7 @@ def test_shell_subprocess_env_patch_strips_github_tokens(monkeypatch: pytest.Mon
     from mindroom.tools import shell
 
     _seed_token(monkeypatch)
+    hooks._install_runtime_patches()
     monkeypatch.setenv("PATH", "/usr/bin")
     plan = hooks.execution_plan_for_call("run_shell_command", {"args": ["gh", "api", "/user"]}, _settings())
 

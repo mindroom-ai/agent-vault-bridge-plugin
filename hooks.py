@@ -26,6 +26,7 @@ from mindroom.hooks import (
 from .vault_client import BootstrapSettings, SessionToken, VaultSettings, mint_proxy_session_token
 
 PLUGIN_NAME = "agent-vault-bridge"
+LEGACY_SHIM_MODE = "legacy_shim"
 TOKEN_ENV_NAME = "AGENT_VAULT_PROXY_TOKEN"
 CA_ENV_NAME = "AGENT_VAULT_CA_PATH"
 AUDIT_LOG_NAME = "agent-vault-bridge.log"
@@ -68,6 +69,7 @@ def resolve_settings(raw_settings: Mapping[str, object] | None) -> VaultSettings
     bootstrap_map = bootstrap_raw if isinstance(bootstrap_raw, Mapping) else {}
 
     return VaultSettings(
+        mode=_string_setting(raw, "mode", _DEFAULT_VAULT_SETTINGS.mode),
         vault_api=_string_setting(raw, "vault_api", _DEFAULT_VAULT_SETTINGS.vault_api),
         vault_proxy=_string_setting(raw, "vault_proxy", _DEFAULT_VAULT_SETTINGS.vault_proxy),
         ca_path=_string_setting(raw, "ca_path", _DEFAULT_VAULT_SETTINGS.ca_path),
@@ -151,6 +153,9 @@ def extra_passthrough_with_plan(existing: str | None, plan: ExecutionPlan) -> st
 async def prime_agent_vault_session(ctx: AgentLifecycleContext) -> None:
     """Mint the shared proxy session token after the bot is ready."""
     settings = _activate_settings(ctx.settings)
+    if settings.mode != LEGACY_SHIM_MODE:
+        return
+    _install_runtime_patches()
     ensure_session_token(settings)
     ctx.logger.info(
         "agent-vault-bridge session token ready",
@@ -163,6 +168,9 @@ async def prime_agent_vault_session(ctx: AgentLifecycleContext) -> None:
 async def prepare_brokered_tool_call(ctx: ToolBeforeCallContext) -> None:
     """Prepare one shell call for Agent Vault routing when it targets GitHub."""
     settings = _activate_settings(ctx.settings)
+    if settings.mode != LEGACY_SHIM_MODE:
+        return
+    _install_runtime_patches()
     try:
         plan = execution_plan_for_call(ctx.tool_name, ctx.arguments, settings)
     except Exception:
@@ -429,6 +437,3 @@ def _patch_shell_subprocess_env() -> None:
 
     shell_subprocess_env_with_agent_vault._agent_vault_bridge_patched = True
     shell._shell_subprocess_env = shell_subprocess_env_with_agent_vault
-
-
-_install_runtime_patches()
