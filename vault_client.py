@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +14,7 @@ class BootstrapSettings:
 
     method: str = "docker_exec"
     container: str = "agent-vault"
+    token_file: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +45,8 @@ class SessionToken:
 
 def mint_proxy_session_token(settings: VaultSettings, *, now: float | None = None) -> SessionToken:
     """Mint one proxy session token using the configured bootstrap method."""
+    if settings.bootstrap.method == "token_file":
+        return _read_agent_token_file(settings, now=now)
     if settings.bootstrap.method != "docker_exec":
         msg = f"Unsupported agent-vault bootstrap method: {settings.bootstrap.method}"
         raise ValueError(msg)
@@ -73,6 +77,25 @@ def mint_proxy_session_token(settings: VaultSettings, *, now: float | None = Non
 
     resolved_now = time.time() if now is None else now
     return SessionToken(value=token, expires_at=resolved_now + ttl_seconds)
+
+
+def _read_agent_token_file(settings: VaultSettings, *, now: float | None = None) -> SessionToken:
+    """Read a long-lived proxy-role agent token from disk.
+
+    The expiry only bounds the in-process cache: the token is re-read from
+    disk every session_ttl_seconds so out-of-band rotations are picked up
+    without a restart.
+    """
+    token_path = settings.bootstrap.token_file
+    if not token_path:
+        msg = "bootstrap.token_file is required when bootstrap.method is token_file"
+        raise ValueError(msg)
+    token = _last_nonempty_line(Path(token_path).expanduser().read_text(encoding="utf-8"))
+    if not token:
+        msg = f"agent-vault token file is empty: {token_path}"
+        raise RuntimeError(msg)
+    resolved_now = time.time() if now is None else now
+    return SessionToken(value=token, expires_at=resolved_now + max(1, int(settings.session_ttl_seconds)))
 
 
 def _last_nonempty_line(text: str) -> str:

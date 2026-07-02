@@ -68,17 +68,28 @@ settings:
   brokered_hosts: [api.github.com]          # Upstream hosts gated by the plugin
   gated_tools: [shell]                      # Tool names whose calls may be brokered
   bootstrap:
-    method: docker_exec                     # How to mint a session token
+    method: docker_exec                     # How to obtain a proxy session token
     container: agent-vault                  # Docker container name running Agent Vault
+```
+
+Two bootstrap methods are supported:
+
+- `docker_exec` (default) — mint short-TTL session tokens via `docker exec <container> agent-vault vault token --role proxy`. Requires the Agent Vault container to run on the same host as MindRoom.
+- `token_file` — read a long-lived **proxy-role agent token** from a local file. Use this when Agent Vault runs on another machine: create the agent once with `agent-vault agent create <name> --vault <vault>:proxy --token-only` and store the printed token (mode 0600). The file is re-read every `session_ttl_seconds`, so rotating the token on disk needs no restart. A proxy-role token can exercise credentials through the proxy but can never read them.
+
+```yaml
+  bootstrap:
+    method: token_file
+    token_file: ~/.config/agent-vault/proxy-token
 ```
 
 To broker additional services, add the host to `brokered_hosts` and add the corresponding service + credential to your Agent Vault instance.
 
 ## Prerequisites
 
-1. **Agent Vault running locally** on `127.0.0.1:14321` / `127.0.0.1:14322` with the target service registered and a credential set.
-2. **CA cert** fetched once and placed at `/etc/ssl/agent-vault-ca.pem` (mode 0644).
-3. **Docker container named `agent-vault`** so `docker exec` can mint session tokens.
+1. **A reachable Agent Vault** (local or remote) with the target service registered and a credential set. The management API and HTTPS proxy ports must be directly reachable from the MindRoom host — the proxy speaks HTTP CONNECT, which cannot sit behind a normal reverse proxy.
+2. **CA cert** fetched once (`agent-vault ca fetch --address <api-url>`) and placed at the configured `ca_path` (mode 0644).
+3. **A token source**: either a local Docker container named `agent-vault` (`bootstrap.method: docker_exec`), or a proxy-role agent token file (`bootstrap.method: token_file`) for remote vaults.
 
 A NixOS module that wires all three is available at `mindroom/configs/nixos/optional/agent-vault.nix`.
 

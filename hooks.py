@@ -81,6 +81,7 @@ def resolve_settings(raw_settings: Mapping[str, object] | None) -> VaultSettings
         bootstrap=BootstrapSettings(
             method=_string_setting(bootstrap_map, "method", _DEFAULT_BOOTSTRAP_SETTINGS.method),
             container=_string_setting(bootstrap_map, "container", _DEFAULT_BOOTSTRAP_SETTINGS.container),
+            token_file=_string_setting(bootstrap_map, "token_file", _DEFAULT_BOOTSTRAP_SETTINGS.token_file),
         ),
     )
 

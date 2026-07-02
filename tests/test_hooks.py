@@ -4,24 +4,18 @@
 from __future__ import annotations
 
 import re
-import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
-
-PLUGIN_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = Path("/srv/mindroom/src")
-for path in (PLUGIN_ROOT, SRC_ROOT):
-    if str(path) not in sys.path:
-        sys.path.insert(0, str(path))
-
 from mindroom.constants import RuntimePaths
 
 from agent_vault_bridge_test_import import hooks
 from agent_vault_bridge_test_import.vault_client import SessionToken
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _settings() -> hooks.VaultSettings:
