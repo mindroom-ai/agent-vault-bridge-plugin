@@ -370,33 +370,21 @@ def _patch_sandbox_proxy_env() -> None:
 
     def call_proxy_sync_with_agent_vault_env(
         *,
-        runtime_paths: object,
         tool_name: str,
         function_name: str,
-        args: tuple[object, ...],
         kwargs: dict[str, object],
-        credentials_manager: object | None,
-        shared_storage_root_path: Path | None = None,
-        tool_config_overrides: dict[str, object] | None = None,
-        tool_init_overrides: dict[str, object] | None = None,
         execution_env: dict[str, str] | None = None,
         extra_env_passthrough: str | None = None,
-        worker_target: object | None = None,
+        **call_kwargs: Any,
     ) -> object:
         plan = execution_plan_for_call(tool_name, kwargs, _settings, function_name=function_name)
         return original_call_proxy_sync(
-            runtime_paths=runtime_paths,
             tool_name=tool_name,
             function_name=function_name,
-            args=args,
             kwargs=kwargs,
-            credentials_manager=credentials_manager,
-            shared_storage_root_path=shared_storage_root_path,
-            tool_config_overrides=tool_config_overrides,
-            tool_init_overrides=tool_init_overrides,
             execution_env=env_with_plan(execution_env, plan) if plan.gated else execution_env,
             extra_env_passthrough=extra_passthrough_with_plan(extra_env_passthrough, plan),
-            worker_target=worker_target,
+            **call_kwargs,
         )
 
     call_proxy_sync_with_agent_vault_env._agent_vault_bridge_patched = True
@@ -412,15 +400,9 @@ def _patch_shell_subprocess_env() -> None:
 
     def shell_subprocess_env_with_agent_vault(
         runtime_env: dict[str, str],
-        *,
-        base_process_env: dict[str, str] | None = None,
-        shell_path_prepend: str | None = None,
+        **kwargs: Any,
     ) -> dict[str, str]:
-        env = original_shell_subprocess_env(
-            runtime_env,
-            base_process_env=base_process_env,
-            shell_path_prepend=shell_path_prepend,
-        )
+        env = original_shell_subprocess_env(runtime_env, **kwargs)
         plan = _local_shell_plan.get()
         if plan is None:
             for name in SECRET_ENV_NAMES:
