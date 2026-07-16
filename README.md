@@ -93,6 +93,31 @@ To broker additional services, add the host to `brokered_hosts` and add the corr
 
 A NixOS module that wires all three is available at `mindroom/configs/nixos/optional/agent-vault.nix`.
 
+## Install
+
+Vendor this plugin with the MindRoom CLI:
+
+```bash
+mindroom plugins install agent-vault-bridge-plugin
+```
+
+Then reference it from `config.yaml`:
+
+```yaml
+plugins:
+  - path: plugins/agent-vault-bridge-plugin
+```
+
+Update to the latest commit later with:
+
+```bash
+mindroom plugins update agent-vault-bridge-plugin
+```
+
+The command pins the exact installed commit in `.mindroom-plugin.lock.json` and strictly validates the plugin before activating it.
+It requires a MindRoom release newer than v2026.7.175.
+For a manual checkout instead, see Setup below.
+
 ## Setup
 
 1. Copy this plugin to `~/.mindroom-chat/plugins/agent-vault-bridge`.
