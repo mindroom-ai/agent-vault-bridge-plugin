@@ -255,6 +255,8 @@ def _upstream_host_for_arguments(arguments: Mapping[str, object], brokered_hosts
 
 def _shell_args(arguments: Mapping[str, object]) -> tuple[str, ...]:
     raw_args = arguments.get("args")
+    if isinstance(raw_args, str):
+        return (raw_args,)
     if not isinstance(raw_args, list):
         return ()
     return tuple(item for item in raw_args if isinstance(item, str))

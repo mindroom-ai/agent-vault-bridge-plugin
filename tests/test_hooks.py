@@ -26,11 +26,15 @@ def _seed_token(monkeypatch: pytest.MonkeyPatch, value: str = "session-token") -
     monkeypatch.setattr(hooks, "_session_token", SessionToken(value=value, expires_at=time.time() + 600))
 
 
-def test_gh_api_call_builds_proxy_env_and_path(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("raw_args", [["gh", "api", "/user"], "gh api /user"])
+def test_gh_api_call_builds_proxy_env_and_path(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_args: list[str] | str,
+) -> None:
     _seed_token(monkeypatch)
     monkeypatch.setenv("PATH", "/usr/bin")
 
-    plan = hooks.execution_plan_for_call("run_shell_command", {"args": ["gh", "api", "/user"]}, _settings())
+    plan = hooks.execution_plan_for_call("run_shell_command", {"args": raw_args}, _settings())
 
     assert plan.routed
     assert plan.upstream_host == "api.github.com"
