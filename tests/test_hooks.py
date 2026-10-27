@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import time
 from pathlib import Path
@@ -147,6 +148,22 @@ async def test_other_tools_get_no_environment_changes(
     )
 
     assert changes == ({}, (), None)
+
+
+@pytest.mark.parametrize("method", ["decline", "prepend_path"])
+def test_plugin_refuses_to_load_on_a_mindroom_without_the_hook_methods(
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+) -> None:
+    """On an older MindRoom, loading fails with the minimum release instead of brokered calls running unproxied."""
+    monkeypatch.delattr(ToolEnvironmentContext, method)
+    module_name = f"{hooks.__package__}.hooks_on_older_mindroom"
+    spec = importlib.util.spec_from_file_location(module_name, PLUGIN_ROOT / "hooks.py")
+    assert spec is not None
+    assert spec.loader is not None
+
+    with pytest.raises(ImportError, match=r"needs the first MindRoom release after v2026\.10\.614 or newer"):
+        spec.loader.exec_module(importlib.util.module_from_spec(spec))
 
 
 def _before_call_context(correlation_id: str) -> SimpleNamespace:

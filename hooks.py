@@ -22,6 +22,15 @@ from mindroom.plugin_api import (
 
 from .vault_client import BootstrapSettings, SessionToken, VaultSettings, mint_proxy_session_token
 
+# Without these, a brokered command would run without the proxy. MindRoom has no plugin-API version marker and the
+# release that adds them has no tag yet, so the check looks for the methods themselves.
+if not all(hasattr(ToolEnvironmentContext, method) for method in ("decline", "prepend_path")):
+    msg = (
+        "agent-vault-bridge needs the first MindRoom release after v2026.10.614 or newer, "
+        "whose tool:environment hook can decline a call and put a directory first on PATH"
+    )
+    raise ImportError(msg)
+
 PLUGIN_NAME = "agent-vault-bridge"
 TOKEN_ENV_NAME = "AGENT_VAULT_PROXY_TOKEN"
 CA_ENV_NAME = "AGENT_VAULT_CA_PATH"
