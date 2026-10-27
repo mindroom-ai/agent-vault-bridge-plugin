@@ -2,24 +2,23 @@
 
 from __future__ import annotations
 
-import contextlib
 import os
 import re
 import time
-from collections.abc import Iterator, Mapping
-from contextvars import ContextVar
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 from urllib.parse import urlparse
 
-from mindroom.hooks import (
+from mindroom.plugin_api import (
     EVENT_BOT_READY,
     EVENT_TOOL_AFTER_CALL,
     EVENT_TOOL_BEFORE_CALL,
+    EVENT_TOOL_ENVIRONMENT,
     AgentLifecycleContext,
     ToolAfterCallContext,
     ToolBeforeCallContext,
+    ToolEnvironmentContext,
     hook,
 )
 
@@ -43,10 +42,8 @@ _DEFAULT_VAULT_SETTINGS = VaultSettings()
 class ExecutionPlan:
     """How one tool call should be adjusted."""
 
-    gated: bool
     upstream_host: str | None
     env_overlay: dict[str, str]
-    extra_passthrough: tuple[str, ...]
 
     @property
     def routed(self) -> bool:
@@ -55,9 +52,6 @@ class ExecutionPlan:
 
 
 _session_token: SessionToken | None = None
-_settings = VaultSettings()
-_local_shell_plan: ContextVar[ExecutionPlan | None] = ContextVar("agent_vault_bridge_plan", default=None)
-_patches_installed = False
 _audit_host_by_correlation: dict[str, str] = {}
 
 
@@ -102,57 +96,23 @@ def execution_plan_for_call(
     tool_name: str,
     arguments: Mapping[str, object],
     settings: VaultSettings,
-    *,
-    function_name: str | None = None,
 ) -> ExecutionPlan:
     """Return the env and audit plan for one tool call."""
-    gated = _is_gated_tool(tool_name, function_name, settings.gated_tools)
-    if not gated:
-        return ExecutionPlan(gated=False, upstream_host=None, env_overlay={}, extra_passthrough=())
+    if not _is_gated_tool(tool_name, settings.gated_tools):
+        return ExecutionPlan(upstream_host=None, env_overlay={})
 
     upstream_host = _upstream_host_for_arguments(arguments, settings.brokered_hosts)
     if upstream_host is None:
-        return ExecutionPlan(gated=True, upstream_host=None, env_overlay={}, extra_passthrough=())
+        return ExecutionPlan(upstream_host=None, env_overlay={})
 
     token = ensure_session_token(settings)
-    env_overlay = _proxy_env(settings, token)
-    return ExecutionPlan(
-        gated=True,
-        upstream_host=upstream_host,
-        env_overlay=env_overlay,
-        extra_passthrough=tuple(env_overlay),
-    )
-
-
-def env_with_plan(base_env: Mapping[str, str] | None, plan: ExecutionPlan) -> dict[str, str]:
-    """Apply secret stripping and any broker overlay to an execution env."""
-    env = dict(base_env or {})
-    for name in SECRET_ENV_NAMES:
-        env.pop(name, None)
-    if plan.routed:
-        env.update(plan.env_overlay)
-    return env
-
-
-def extra_passthrough_with_plan(existing: str | None, plan: ExecutionPlan) -> str | None:
-    """Return shell extra passthrough names needed for sandboxed broker env."""
-    if not plan.routed:
-        return existing
-
-    names: list[str] = []
-    for chunk in (existing or "").replace("\n", ",").split(","):
-        name = chunk.strip()
-        if name:
-            names.append(name)
-    names.extend(name for name in plan.extra_passthrough if name not in names)
-    return ",".join(names)
+    return ExecutionPlan(upstream_host=upstream_host, env_overlay=_proxy_env(settings, token))
 
 
 @hook(EVENT_BOT_READY, name="agent-vault-bridge-ready", priority=50, timeout_ms=30000)
 async def prime_agent_vault_session(ctx: AgentLifecycleContext) -> None:
     """Mint the shared proxy session token after the bot is ready."""
-    settings = _activate_settings(ctx.settings)
-    ensure_session_token(settings)
+    ensure_session_token(resolve_settings(ctx.settings))
     ctx.logger.info(
         "agent-vault-bridge session token ready",
         entity_name=ctx.entity_name,
@@ -162,12 +122,12 @@ async def prime_agent_vault_session(ctx: AgentLifecycleContext) -> None:
 
 @hook(EVENT_TOOL_BEFORE_CALL, name="agent-vault-bridge-before", priority=20, timeout_ms=5000)
 async def prepare_brokered_tool_call(ctx: ToolBeforeCallContext) -> None:
-    """Prepare one shell call for Agent Vault routing when it targets GitHub."""
-    settings = _activate_settings(ctx.settings)
+    """Mark one brokered shell call for the audit log, or decline it when no proxy session is available."""
+    settings = resolve_settings(ctx.settings)
     try:
         plan = execution_plan_for_call(ctx.tool_name, ctx.arguments, settings)
     except Exception:
-        if _is_gated_tool(ctx.tool_name, None, settings.gated_tools) and _upstream_host_for_arguments(
+        if _is_gated_tool(ctx.tool_name, settings.gated_tools) and _upstream_host_for_arguments(
             ctx.arguments,
             settings.brokered_hosts,
         ):
@@ -175,7 +135,6 @@ async def prepare_brokered_tool_call(ctx: ToolBeforeCallContext) -> None:
             return
         raise
 
-    _local_shell_plan.set(plan)
     for name in SECRET_ENV_NAMES:
         ctx.arguments.pop(name, None)
     if plan.routed:
@@ -183,6 +142,24 @@ async def prepare_brokered_tool_call(ctx: ToolBeforeCallContext) -> None:
         ctx.arguments[AUDIT_ROUTED_ARGUMENT] = True
         if ctx.correlation_id:
             _audit_host_by_correlation[ctx.correlation_id] = plan.upstream_host
+
+
+@hook(EVENT_TOOL_ENVIRONMENT, name="agent-vault-bridge-environment", priority=20, timeout_ms=5000)
+async def set_shell_command_environment(ctx: ToolEnvironmentContext) -> None:
+    """Keep GitHub tokens from every shell command, and send a brokered one through the Agent Vault proxy."""
+    if ctx.registered_toolkit != "shell":
+        return
+    for name in SECRET_ENV_NAMES:
+        ctx.unset_env(name)
+    try:
+        plan = execution_plan_for_call(ctx.function_name, ctx.arguments, resolve_settings(ctx.settings))
+    except Exception:
+        # Raising would also drop the removals above. The before hook declines a call it cannot mint a session for,
+        # so this fails only when the session expired while the call waited, such as for approval.
+        ctx.logger.exception("agent-vault-bridge could not mint a proxy session for this shell call")
+        return
+    for name, value in plan.env_overlay.items():
+        ctx.set_env(name, value)
 
 
 @hook(EVENT_TOOL_AFTER_CALL, name="agent-vault-bridge-after", priority=20, timeout_ms=3000)
@@ -204,12 +181,6 @@ async def audit_brokered_tool_call(ctx: ToolAfterCallContext) -> None:
         handle.write(line)
 
 
-def _activate_settings(raw_settings: Mapping[str, object] | None) -> VaultSettings:
-    global _settings
-    _settings = resolve_settings(raw_settings)
-    return _settings
-
-
 def _proxy_env(settings: VaultSettings, token: SessionToken) -> dict[str, str]:
     return {
         "HTTPS_PROXY": settings.vault_proxy,
@@ -228,13 +199,9 @@ def _path_with_plugin_bin(current_path: str) -> str:
     return os.pathsep.join([plugin_bin, *[entry for entry in entries if entry != plugin_bin]])
 
 
-def _is_gated_tool(tool_name: str, function_name: str | None, gated_tools: tuple[str, ...]) -> bool:
+def _is_gated_tool(tool_name: str, gated_tools: tuple[str, ...]) -> bool:
     allowed = {name.strip() for name in gated_tools if name.strip()}
-    if tool_name in allowed or (function_name is not None and function_name in allowed):
-        return True
-    if "shell" in allowed and (tool_name == "run_shell_command" or function_name == "run_shell_command"):
-        return True
-    return False
+    return tool_name in allowed or ("shell" in allowed and tool_name == "run_shell_command")
 
 
 def _upstream_host_for_arguments(arguments: Mapping[str, object], brokered_hosts: tuple[str, ...]) -> str | None:
@@ -310,110 +277,3 @@ def _string_tuple_setting(settings: Mapping[str, object], name: str, default: tu
     if isinstance(value, list | tuple):
         return tuple(item for item in value if isinstance(item, str) and item)
     return default
-
-
-@contextlib.contextmanager
-def _scoped_local_shell_plan(plan: ExecutionPlan) -> Iterator[None]:
-    token = _local_shell_plan.set(plan)
-    previous_values = {name: os.environ.get(name) for name in (*SECRET_ENV_NAMES, *plan.env_overlay)}
-    try:
-        for name in SECRET_ENV_NAMES:
-            os.environ.pop(name, None)
-        if plan.routed:
-            os.environ.update(plan.env_overlay)
-        yield
-    finally:
-        for name, value in previous_values.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
-        _local_shell_plan.reset(token)
-
-
-def _install_runtime_patches() -> None:
-    global _patches_installed
-    if _patches_installed:
-        return
-    _patch_tool_call_env()
-    _patch_sandbox_proxy_env()
-    _patch_shell_subprocess_env()
-    _patches_installed = True
-
-
-def _patch_tool_call_env() -> None:
-    from mindroom.tool_system import tool_hooks
-
-    if getattr(tool_hooks._call_tool, "_agent_vault_bridge_patched", False):
-        return
-    original_call_tool = tool_hooks._call_tool
-
-    async def call_tool_with_agent_vault_env(
-        func: object,
-        args: dict[str, Any],
-        *,
-        tool_name: str,
-        agent_name: str | None,
-    ) -> object:
-        plan = execution_plan_for_call(tool_name, args, _settings)
-        with _scoped_local_shell_plan(plan):
-            return await original_call_tool(func, args, tool_name=tool_name, agent_name=agent_name)
-
-    call_tool_with_agent_vault_env._agent_vault_bridge_patched = True
-    tool_hooks._call_tool = call_tool_with_agent_vault_env
-
-
-def _patch_sandbox_proxy_env() -> None:
-    from mindroom.tool_system import sandbox_proxy
-
-    if getattr(sandbox_proxy._call_proxy_sync, "_agent_vault_bridge_patched", False):
-        return
-    original_call_proxy_sync = sandbox_proxy._call_proxy_sync
-
-    def call_proxy_sync_with_agent_vault_env(
-        *,
-        tool_name: str,
-        function_name: str,
-        kwargs: dict[str, object],
-        execution_env: dict[str, str] | None = None,
-        extra_env_passthrough: str | None = None,
-        **call_kwargs: Any,
-    ) -> object:
-        plan = execution_plan_for_call(tool_name, kwargs, _settings, function_name=function_name)
-        return original_call_proxy_sync(
-            tool_name=tool_name,
-            function_name=function_name,
-            kwargs=kwargs,
-            execution_env=env_with_plan(execution_env, plan) if plan.gated else execution_env,
-            extra_env_passthrough=extra_passthrough_with_plan(extra_env_passthrough, plan),
-            **call_kwargs,
-        )
-
-    call_proxy_sync_with_agent_vault_env._agent_vault_bridge_patched = True
-    sandbox_proxy._call_proxy_sync = call_proxy_sync_with_agent_vault_env
-
-
-def _patch_shell_subprocess_env() -> None:
-    from mindroom.tools import shell
-
-    if getattr(shell._shell_subprocess_env, "_agent_vault_bridge_patched", False):
-        return
-    original_shell_subprocess_env = shell._shell_subprocess_env
-
-    def shell_subprocess_env_with_agent_vault(
-        runtime_env: dict[str, str],
-        **kwargs: Any,
-    ) -> dict[str, str]:
-        env = original_shell_subprocess_env(runtime_env, **kwargs)
-        plan = _local_shell_plan.get()
-        if plan is None:
-            for name in SECRET_ENV_NAMES:
-                env.pop(name, None)
-            return env
-        return env_with_plan(env, plan)
-
-    shell_subprocess_env_with_agent_vault._agent_vault_bridge_patched = True
-    shell._shell_subprocess_env = shell_subprocess_env_with_agent_vault
-
-
-_install_runtime_patches()

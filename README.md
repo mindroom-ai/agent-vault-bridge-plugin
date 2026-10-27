@@ -16,7 +16,7 @@ The plugin gates `run_shell_command` invocations that target brokered hosts (e.g
 ## Features
 
 - Intercepts `run_shell_command` calls that resolve to a brokered upstream host (default: `api.github.com`)
-- Strips `GITHUB_TOKEN`, `GH_TOKEN`, and similar secrets from the subprocess env
+- Strips `GITHUB_TOKEN` and `GH_TOKEN` from every shell command's environment, whether the command runs in MindRoom's process or in a worker
 - Mints short-TTL `proxy`-role session tokens from Agent Vault and supplies them via `Proxy-Authorization` to the local HTTPS proxy
 - Ships a tiny `gh-via-broker` shell wrapper that adapts `gh api <endpoint>` to the proxy + auth header convention
 - Writes a one-line audit record per brokered call to `<workspace>/agent-vault-bridge.log` (no tokens, no bodies)
@@ -29,6 +29,10 @@ agent's run_shell_command(args=["gh","api","/user"])
         │
         ▼
 agent-vault-bridge (tool:before_call)
+   └── mint a proxy session token, or decline the call when none is available
+        │
+        ▼
+agent-vault-bridge (tool:environment)
    ├── strip GITHUB_TOKEN / GH_TOKEN from env
    ├── inject HTTPS_PROXY=https://127.0.0.1:14322
    ├── inject CA_BUNDLE → /etc/ssl/agent-vault-ca.pem
@@ -53,7 +57,8 @@ agent receives response; agent-vault-bridge (tool:after_call) appends audit line
 | Hook | Event | Purpose |
 |------|-------|---------|
 | `prime_agent_vault_session` | `bot:ready` | Mint a long-TTL proxy session token at startup; cache and reuse |
-| `prepare_brokered_tool_call` | `tool:before_call` | Detect brokered host, strip secrets, set proxy + token env, prepend shim PATH |
+| `prepare_brokered_tool_call` | `tool:before_call` | Detect brokered host, mint the session token, mark the call for audit; decline when no token is available |
+| `set_shell_command_environment` | `tool:environment` | Strip GitHub tokens from every shell command; for a brokered call, set proxy + token env and prepend shim PATH |
 | `audit_brokered_tool_call` | `tool:after_call` | Append one sanitized audit line to `<agent-workspace>/agent-vault-bridge.log` |
 
 ## Configuration
@@ -90,11 +95,12 @@ To broker additional services, add the host to `brokered_hosts` and add the corr
 
 ## Prerequisites
 
-1. **A reachable Agent Vault** (local or remote) with the target service registered and a credential set. The management API and HTTPS proxy ports must be directly reachable from the MindRoom host — the proxy speaks HTTP CONNECT, which cannot sit behind a normal reverse proxy.
-2. **CA cert** fetched once (`agent-vault ca fetch --address <api-url>`) and placed at the configured `ca_path` (mode 0644).
-3. **A token source**: either a local Docker container named `agent-vault` (`bootstrap.method: docker_exec`), or a proxy-role agent token file (`bootstrap.method: token_file`) for remote vaults.
+1. **MindRoom v2026.10.583 or newer**, which provides the `tool:environment` hook the plugin uses to set each shell command's environment.
+2. **A reachable Agent Vault** (local or remote) with the target service registered and a credential set. The management API and HTTPS proxy ports must be directly reachable from the MindRoom host — the proxy speaks HTTP CONNECT, which cannot sit behind a normal reverse proxy.
+3. **CA cert** fetched once (`agent-vault ca fetch --address <api-url>`) and placed at the configured `ca_path` (mode 0644).
+4. **A token source**: either a local Docker container named `agent-vault` (`bootstrap.method: docker_exec`), or a proxy-role agent token file (`bootstrap.method: token_file`) for remote vaults.
 
-A NixOS module that wires all three is available at `mindroom/configs/nixos/optional/agent-vault.nix`.
+A NixOS module that wires the last three is available at `mindroom/configs/nixos/optional/agent-vault.nix`.
 
 ## Install
 
@@ -132,7 +138,6 @@ For a manual checkout instead, see Setup below.
 
 ## Limitations and Known Trade-offs
 
-- The plugin currently monkey-patches private MindRoom internals (`mindroom.tool_system.tool_hooks._call_tool`, `mindroom.tool_system.sandbox_proxy._call_proxy_sync`, `mindroom.tools.shell._shell_subprocess_env`) because `ToolBeforeCallContext` does not yet expose an env-injection surface. Patches are sentinel-guarded for idempotency.
 - The `gh-via-broker` shim only handles the `gh api <endpoint>` form. Other `gh` subcommands fall through with a clear stderr message.
 - Hosts not on `brokered_hosts` are not gated; agents can still call them directly without the proxy.
 - Bootstrap uses `docker exec` to mint session tokens — this requires the MindRoom process to have rights to run `docker exec` against the `agent-vault` container.

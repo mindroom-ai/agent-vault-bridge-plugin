@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 
 import pytest
 from mindroom.constants import RuntimePaths
+from mindroom.plugin_api import ToolEnvironmentContext
 
 from agent_vault_bridge_test_import import hooks
 from agent_vault_bridge_test_import.vault_client import SessionToken
@@ -24,6 +25,25 @@ def _settings() -> hooks.VaultSettings:
 
 def _seed_token(monkeypatch: pytest.MonkeyPatch, value: str = "session-token") -> None:
     monkeypatch.setattr(hooks, "_session_token", SessionToken(value=value, expires_at=time.time() + 600))
+
+
+async def _command_env_changes(
+    arguments: dict[str, object],
+    *,
+    function_name: str = "run_shell_command",
+    registered_toolkit: str | None = "shell",
+) -> dict[str, str | None]:
+    """Run the environment hook for one call; return the variables it sets, with None for the ones it removes."""
+    ctx = ToolEnvironmentContext(
+        function_name=function_name,
+        registered_toolkit=registered_toolkit,
+        arguments=arguments,
+        agent_name="code",
+        room_id=None,
+        requester_id=None,
+    )
+    await hooks.set_shell_command_environment(ctx)
+    return dict(ctx._environment.values)
 
 
 @pytest.mark.parametrize("raw_args", [["gh", "api", "/user"], "gh api /user"])
@@ -59,21 +79,13 @@ def test_gh_api_inside_bash_command_is_routed(monkeypatch: pytest.MonkeyPatch) -
     assert plan.upstream_host == "api.github.com"
 
 
-def test_secret_env_is_stripped_without_routing(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_every_shell_command_loses_github_tokens_without_routing(monkeypatch: pytest.MonkeyPatch) -> None:
     _seed_token(monkeypatch)
-    plan = hooks.execution_plan_for_call(
-        "run_shell_command",
-        {"args": ["curl", "https://example.com/"]},
-        _settings(),
-    )
 
-    env = hooks.env_with_plan({"GITHUB_TOKEN": "secret", "GH_TOKEN": "secret", "PATH": "/usr/bin"}, plan)
+    changes = await _command_env_changes({"args": ["curl", "https://example.com/"]})
 
-    assert plan.gated
-    assert not plan.routed
-    assert "GITHUB_TOKEN" not in env
-    assert "GH_TOKEN" not in env
-    assert env["PATH"] == "/usr/bin"
+    assert changes == {"GITHUB_TOKEN": None, "GH_TOKEN": None}
 
 
 def test_curl_to_github_is_routed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -86,7 +98,6 @@ def test_curl_to_github_is_routed(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert plan.routed
     assert plan.upstream_host == "api.github.com"
-    assert "AGENT_VAULT_PROXY_TOKEN" in hooks.extra_passthrough_with_plan(None, plan)
 
 
 @pytest.mark.asyncio
@@ -140,20 +151,44 @@ async def test_after_hook_writes_sanitized_audit_line(tmp_path: Path) -> None:
     assert "session-token" not in line
 
 
-def test_shell_subprocess_env_patch_strips_github_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
-    from mindroom.tools import shell
-
+@pytest.mark.asyncio
+async def test_brokered_shell_command_gets_proxy_env_without_github_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
     _seed_token(monkeypatch)
     monkeypatch.setenv("PATH", "/usr/bin")
-    plan = hooks.execution_plan_for_call("run_shell_command", {"args": ["gh", "api", "/user"]}, _settings())
 
-    with hooks._scoped_local_shell_plan(plan):
-        env = shell._shell_subprocess_env(
-            {"GITHUB_TOKEN": "secret", "GH_TOKEN": "secret", "PATH": "/usr/bin"},
-            base_process_env={},
-        )
+    changes = await _command_env_changes({"args": ["gh", "api", "/user"]})
 
-    assert env["AGENT_VAULT_PROXY_TOKEN"] == "session-token"
-    assert env["PATH"].split(":")[0] == str(PLUGIN_ROOT / "bin")
-    assert "GITHUB_TOKEN" not in env
-    assert "GH_TOKEN" not in env
+    assert changes["GITHUB_TOKEN"] is None
+    assert changes["GH_TOKEN"] is None
+    assert changes["HTTPS_PROXY"] == "https://127.0.0.1:14322"
+    assert changes["AGENT_VAULT_PROXY_TOKEN"] == "session-token"
+    assert changes["PATH"] == f"{PLUGIN_ROOT / 'bin'}:/usr/bin"
+
+
+@pytest.mark.asyncio
+async def test_shell_command_loses_github_tokens_when_no_session_can_be_minted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_to_mint(*_args: object, **_kwargs: object) -> SessionToken:
+        msg = "agent-vault is down"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(hooks, "_session_token", None)
+    monkeypatch.setattr(hooks, "mint_proxy_session_token", fail_to_mint)
+
+    changes = await _command_env_changes({"args": ["gh", "api", "/user"]})
+
+    assert changes == {"GITHUB_TOKEN": None, "GH_TOKEN": None}
+
+
+@pytest.mark.asyncio
+async def test_other_tools_get_no_environment_changes(monkeypatch: pytest.MonkeyPatch) -> None:
+    _seed_token(monkeypatch)
+
+    changes = await _command_env_changes(
+        {"args": ["gh", "api", "/user"]},
+        function_name="run_python_code",
+        registered_toolkit="python",
+    )
+
+    assert changes == {}
