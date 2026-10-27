@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import os
 import re
 import time
 from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -28,27 +26,15 @@ PLUGIN_NAME = "agent-vault-bridge"
 TOKEN_ENV_NAME = "AGENT_VAULT_PROXY_TOKEN"
 CA_ENV_NAME = "AGENT_VAULT_CA_PATH"
 AUDIT_LOG_NAME = "agent-vault-bridge.log"
-AUDIT_HOST_ARGUMENT = "_agent_vault_bridge_upstream_host"
-AUDIT_ROUTED_ARGUMENT = "_agent_vault_bridge_routed"
 SECRET_ENV_NAMES = ("GITHUB_TOKEN", "GH_TOKEN")
+# The shims a brokered command finds first on PATH, so `gh` and `curl` send the proxy session.
+SHIM_DIR = str(Path(__file__).resolve().parent / "bin")
+SESSION_UNAVAILABLE = "Agent Vault proxy session is unavailable for this GitHub call."
 _TOKEN_REFRESH_SKEW_SECONDS = 60
 _GITHUB_TOKEN_PATTERNS = (re.compile(r"github_pat_[A-Za-z0-9_]+"), re.compile(r"ghp_[A-Za-z0-9_]+"))
 _GH_API_PATTERN = re.compile(r"(?:^|[;&|()\s])(?:gh|gh-via-broker)\s+api(?:\s|$)")
 _DEFAULT_BOOTSTRAP_SETTINGS = BootstrapSettings()
 _DEFAULT_VAULT_SETTINGS = VaultSettings()
-
-
-@dataclass(frozen=True, slots=True)
-class ExecutionPlan:
-    """How one tool call should be adjusted."""
-
-    upstream_host: str | None
-    env_overlay: dict[str, str]
-
-    @property
-    def routed(self) -> bool:
-        """Return whether the call should use the Agent Vault proxy."""
-        return self.upstream_host is not None
 
 
 _session_token: SessionToken | None = None
@@ -92,21 +78,11 @@ def ensure_session_token(settings: VaultSettings) -> SessionToken:
     return _session_token
 
 
-def execution_plan_for_call(
-    tool_name: str,
-    arguments: Mapping[str, object],
-    settings: VaultSettings,
-) -> ExecutionPlan:
-    """Return the env and audit plan for one tool call."""
+def brokered_host_for_call(tool_name: str, arguments: Mapping[str, object], settings: VaultSettings) -> str | None:
+    """Return the brokered upstream host one tool call targets, or None when the call is not brokered."""
     if not _is_gated_tool(tool_name, settings.gated_tools):
-        return ExecutionPlan(upstream_host=None, env_overlay={})
-
-    upstream_host = _upstream_host_for_arguments(arguments, settings.brokered_hosts)
-    if upstream_host is None:
-        return ExecutionPlan(upstream_host=None, env_overlay={})
-
-    token = ensure_session_token(settings)
-    return ExecutionPlan(upstream_host=upstream_host, env_overlay=_proxy_env(settings, token))
+        return None
+    return _upstream_host_for_arguments(arguments, settings.brokered_hosts)
 
 
 @hook(EVENT_BOT_READY, name="agent-vault-bridge-ready", priority=50, timeout_ms=30000)
@@ -122,50 +98,50 @@ async def prime_agent_vault_session(ctx: AgentLifecycleContext) -> None:
 
 @hook(EVENT_TOOL_BEFORE_CALL, name="agent-vault-bridge-before", priority=20, timeout_ms=5000)
 async def prepare_brokered_tool_call(ctx: ToolBeforeCallContext) -> None:
-    """Mark one brokered shell call for the audit log, or decline it when no proxy session is available."""
+    """Decline a brokered shell call before any approval when no proxy session is available; else mark it for audit."""
     settings = resolve_settings(ctx.settings)
-    try:
-        plan = execution_plan_for_call(ctx.tool_name, ctx.arguments, settings)
-    except Exception:
-        if _is_gated_tool(ctx.tool_name, settings.gated_tools) and _upstream_host_for_arguments(
-            ctx.arguments,
-            settings.brokered_hosts,
-        ):
-            ctx.decline("Agent Vault proxy session is unavailable for this GitHub call.")
-            return
-        raise
-
-    for name in SECRET_ENV_NAMES:
-        ctx.arguments.pop(name, None)
-    if plan.routed:
-        ctx.arguments[AUDIT_HOST_ARGUMENT] = plan.upstream_host
-        ctx.arguments[AUDIT_ROUTED_ARGUMENT] = True
-        if ctx.correlation_id:
-            _audit_host_by_correlation[ctx.correlation_id] = plan.upstream_host
+    host = brokered_host_for_call(ctx.tool_name, ctx.arguments, settings)
+    if host is None:
+        return
+    if _session_token_or_decline(ctx, settings) is None:
+        return
+    if ctx.correlation_id:
+        _audit_host_by_correlation[ctx.correlation_id] = host
 
 
-@hook(EVENT_TOOL_ENVIRONMENT, name="agent-vault-bridge-environment", priority=20, timeout_ms=5000)
-async def set_shell_command_environment(ctx: ToolEnvironmentContext) -> None:
-    """Keep GitHub tokens from every shell command, and send a brokered one through the Agent Vault proxy."""
+# Its own hook, so a failure of the broker hook below can never hand a command the tokens.
+@hook(EVENT_TOOL_ENVIRONMENT, name="agent-vault-bridge-strip-tokens", priority=20)
+async def strip_github_tokens(ctx: ToolEnvironmentContext) -> None:
+    """Keep GitHub tokens from every shell command."""
     if ctx.registered_toolkit != "shell":
         return
     for name in SECRET_ENV_NAMES:
         ctx.unset_env(name)
-    try:
-        plan = execution_plan_for_call(ctx.function_name, ctx.arguments, resolve_settings(ctx.settings))
-    except Exception:
-        # Raising would also drop the removals above. The before hook declines a call it cannot mint a session for,
-        # so this fails only when the session expired while the call waited, such as for approval.
-        ctx.logger.exception("agent-vault-bridge could not mint a proxy session for this shell call")
+
+
+@hook(EVENT_TOOL_ENVIRONMENT, name="agent-vault-bridge-proxy", priority=20, timeout_ms=5000)
+async def route_brokered_shell_command(ctx: ToolEnvironmentContext) -> None:
+    """Send a brokered shell command through the Agent Vault proxy, or decline it when no proxy session is available.
+
+    The session is checked again here because it can expire while the call waits, for example for approval.
+    """
+    if ctx.registered_toolkit != "shell":
         return
-    for name, value in plan.env_overlay.items():
+    settings = resolve_settings(ctx.settings)
+    if brokered_host_for_call(ctx.function_name, ctx.arguments, settings) is None:
+        return
+    token = _session_token_or_decline(ctx, settings)
+    if token is None:
+        return
+    for name, value in _proxy_env(settings, token).items():
         ctx.set_env(name, value)
+    ctx.prepend_path(SHIM_DIR)
 
 
 @hook(EVENT_TOOL_AFTER_CALL, name="agent-vault-bridge-after", priority=20, timeout_ms=3000)
 async def audit_brokered_tool_call(ctx: ToolAfterCallContext) -> None:
     """Append one sanitized audit record for a brokered tool call."""
-    host = _audit_host(ctx.arguments) or _audit_host_by_correlation.pop(ctx.correlation_id, None)
+    host = _audit_host_by_correlation.pop(ctx.correlation_id, None)
     if host is None:
         return
 
@@ -181,6 +157,19 @@ async def audit_brokered_tool_call(ctx: ToolAfterCallContext) -> None:
         handle.write(line)
 
 
+def _session_token_or_decline(
+    ctx: ToolBeforeCallContext | ToolEnvironmentContext,
+    settings: VaultSettings,
+) -> SessionToken | None:
+    """Return the proxy session for a brokered call, or decline the call when Agent Vault cannot provide one."""
+    try:
+        return ensure_session_token(settings)
+    except Exception:
+        ctx.logger.exception("agent-vault-bridge could not mint a proxy session")
+        ctx.decline(SESSION_UNAVAILABLE)
+        return None
+
+
 def _proxy_env(settings: VaultSettings, token: SessionToken) -> dict[str, str]:
     return {
         "HTTPS_PROXY": settings.vault_proxy,
@@ -189,14 +178,7 @@ def _proxy_env(settings: VaultSettings, token: SessionToken) -> dict[str, str]:
         "SSL_CERT_FILE": settings.ca_path,
         TOKEN_ENV_NAME: token.value,
         CA_ENV_NAME: settings.ca_path,
-        "PATH": _path_with_plugin_bin(os.environ.get("PATH", "")),
     }
-
-
-def _path_with_plugin_bin(current_path: str) -> str:
-    plugin_bin = str(Path(__file__).resolve().parent / "bin")
-    entries = [entry for entry in current_path.split(os.pathsep) if entry]
-    return os.pathsep.join([plugin_bin, *[entry for entry in entries if entry != plugin_bin]])
 
 
 def _is_gated_tool(tool_name: str, gated_tools: tuple[str, ...]) -> bool:
@@ -235,11 +217,6 @@ def _is_gh_api_call(args: tuple[str, ...]) -> bool:
         if executable in {"gh", "gh-via-broker"} and args[1] == "api":
             return True
     return any(_GH_API_PATTERN.search(arg) for arg in args)
-
-
-def _audit_host(arguments: Mapping[str, object]) -> str | None:
-    host = arguments.get(AUDIT_HOST_ARGUMENT)
-    return host if isinstance(host, str) and host else None
 
 
 def _audit_log_path(storage_root: Path, agent_name: str) -> Path:

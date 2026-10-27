@@ -11,12 +11,14 @@ from unittest.mock import MagicMock
 
 import pytest
 from mindroom.constants import RuntimePaths
+from mindroom.hooks import HookRegistry, emit_collect_environment
 from mindroom.plugin_api import ToolEnvironmentContext
 
 from agent_vault_bridge_test_import import hooks
 from agent_vault_bridge_test_import.vault_client import SessionToken
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+_CA_PATH = "/etc/ssl/agent-vault-ca.pem"
 
 
 def _settings() -> hooks.VaultSettings:
@@ -27,13 +29,27 @@ def _seed_token(monkeypatch: pytest.MonkeyPatch, value: str = "session-token") -
     monkeypatch.setattr(hooks, "_session_token", SessionToken(value=value, expires_at=time.time() + 600))
 
 
-async def _command_env_changes(
+def _vault_is_down(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fail_to_mint(*_args: object, **_kwargs: object) -> SessionToken:
+        msg = "agent-vault is down"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(hooks, "_session_token", None)
+    monkeypatch.setattr(hooks, "mint_proxy_session_token", fail_to_mint)
+
+
+async def _collect_environment(
+    registry: HookRegistry,
     arguments: dict[str, object],
     *,
     function_name: str = "run_shell_command",
     registered_toolkit: str | None = "shell",
-) -> dict[str, str | None]:
-    """Run the environment hook for one call; return the variables it sets, with None for the ones it removes."""
+) -> tuple[dict[str, str | None], tuple[str, ...], str | None]:
+    """Run the plugin's environment hooks for one call, as MindRoom collects them before the call runs.
+
+    Return the variables they set (None for a removal), the directories they put first on PATH, and the reason they
+    declined the call, if they did.
+    """
     ctx = ToolEnvironmentContext(
         function_name=function_name,
         registered_toolkit=registered_toolkit,
@@ -42,86 +58,137 @@ async def _command_env_changes(
         room_id=None,
         requester_id=None,
     )
-    await hooks.set_shell_command_environment(ctx)
-    return dict(ctx._environment.values)
+    environment = await emit_collect_environment(registry, ctx)
+    return dict(environment.values), environment.path_prepend, ctx.decline_reason if ctx.declined else None
 
 
-@pytest.mark.parametrize("raw_args", [["gh", "api", "/user"], "gh api /user"])
-def test_gh_api_call_builds_proxy_env_and_path(
-    monkeypatch: pytest.MonkeyPatch,
-    raw_args: list[str] | str,
-) -> None:
-    _seed_token(monkeypatch)
-    monkeypatch.setenv("PATH", "/usr/bin")
-
-    plan = hooks.execution_plan_for_call("run_shell_command", {"args": raw_args}, _settings())
-
-    assert plan.routed
-    assert plan.upstream_host == "api.github.com"
-    assert plan.env_overlay["HTTPS_PROXY"] == "https://127.0.0.1:14322"
-    assert plan.env_overlay["REQUESTS_CA_BUNDLE"] == "/etc/ssl/agent-vault-ca.pem"
-    assert plan.env_overlay["CURL_CA_BUNDLE"] == "/etc/ssl/agent-vault-ca.pem"
-    assert plan.env_overlay["SSL_CERT_FILE"] == "/etc/ssl/agent-vault-ca.pem"
-    assert plan.env_overlay["AGENT_VAULT_PROXY_TOKEN"] == "session-token"
-    assert plan.env_overlay["PATH"].split(":")[0] == str(PLUGIN_ROOT / "bin")
+@pytest.mark.parametrize(
+    "raw_args",
+    [
+        ["gh", "api", "/user"],
+        "gh api /user",
+        ["bash", "-lc", "echo GH_USER_START; gh api /user | jq -c '{login,id}'"],
+        ["curl", "https://api.github.com/user"],
+    ],
+)
+def test_github_api_calls_are_brokered(raw_args: list[str] | str) -> None:
+    assert hooks.brokered_host_for_call("run_shell_command", {"args": raw_args}, _settings()) == "api.github.com"
 
 
-def test_gh_api_inside_bash_command_is_routed(monkeypatch: pytest.MonkeyPatch) -> None:
-    _seed_token(monkeypatch)
+def test_other_calls_are_not_brokered() -> None:
+    settings = _settings()
+    plain_curl = {"args": ["curl", "https://example.com/"]}
+    gh_api = {"args": ["gh", "api", "/user"]}
 
-    plan = hooks.execution_plan_for_call(
-        "run_shell_command",
-        {"args": ["bash", "-lc", "echo GH_USER_START; gh api /user | jq -c '{login,id}'"]},
-        _settings(),
-    )
-
-    assert plan.routed
-    assert plan.upstream_host == "api.github.com"
+    assert hooks.brokered_host_for_call("run_shell_command", plain_curl, settings) is None
+    assert hooks.brokered_host_for_call("run_python_code", gh_api, settings) is None
 
 
 @pytest.mark.asyncio
-async def test_every_shell_command_loses_github_tokens_without_routing(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_brokered_shell_command_gets_proxy_env_and_shims_without_github_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_registry: HookRegistry,
+) -> None:
     _seed_token(monkeypatch)
 
-    changes = await _command_env_changes({"args": ["curl", "https://example.com/"]})
+    values, path_prepend, declined = await _collect_environment(plugin_registry, {"args": ["gh", "api", "/user"]})
 
-    assert changes == {"GITHUB_TOKEN": None, "GH_TOKEN": None}
+    assert values == {
+        "GITHUB_TOKEN": None,
+        "GH_TOKEN": None,
+        "HTTPS_PROXY": "https://127.0.0.1:14322",
+        "REQUESTS_CA_BUNDLE": _CA_PATH,
+        "CURL_CA_BUNDLE": _CA_PATH,
+        "SSL_CERT_FILE": _CA_PATH,
+        "AGENT_VAULT_PROXY_TOKEN": "session-token",
+        "AGENT_VAULT_CA_PATH": _CA_PATH,
+    }
+    assert path_prepend == (str(PLUGIN_ROOT / "bin"),)
+    assert declined is None
 
 
-def test_curl_to_github_is_routed(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.asyncio
+async def test_every_shell_command_loses_github_tokens_without_routing(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_registry: HookRegistry,
+) -> None:
     _seed_token(monkeypatch)
-    plan = hooks.execution_plan_for_call(
-        "run_shell_command",
-        {"args": ["curl", "https://api.github.com/user"]},
-        _settings(),
+
+    changes = await _collect_environment(plugin_registry, {"args": ["curl", "https://example.com/"]})
+
+    assert changes == ({"GITHUB_TOKEN": None, "GH_TOKEN": None}, (), None)
+
+
+@pytest.mark.asyncio
+async def test_brokered_shell_command_is_declined_when_no_session_can_be_minted(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_registry: HookRegistry,
+) -> None:
+    """The call is refused, and the tokens stay removed, since stripping them is a hook of its own."""
+    _vault_is_down(monkeypatch)
+
+    changes = await _collect_environment(plugin_registry, {"args": ["gh", "api", "/user"]})
+
+    assert changes == ({"GITHUB_TOKEN": None, "GH_TOKEN": None}, (), hooks.SESSION_UNAVAILABLE)
+
+
+@pytest.mark.asyncio
+async def test_other_tools_get_no_environment_changes(
+    monkeypatch: pytest.MonkeyPatch,
+    plugin_registry: HookRegistry,
+) -> None:
+    _seed_token(monkeypatch)
+
+    changes = await _collect_environment(
+        plugin_registry,
+        {"args": ["gh", "api", "/user"]},
+        function_name="run_python_code",
+        registered_toolkit="python",
     )
 
-    assert plan.routed
-    assert plan.upstream_host == "api.github.com"
+    assert changes == ({}, (), None)
+
+
+def _before_call_context(correlation_id: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        tool_name="run_shell_command",
+        arguments={"args": ["gh", "api", "/user"]},
+        settings={},
+        correlation_id=correlation_id,
+        decline=MagicMock(),
+        logger=MagicMock(),
+    )
 
 
 @pytest.mark.asyncio
 async def test_before_hook_marks_brokered_call_for_audit(monkeypatch: pytest.MonkeyPatch) -> None:
     _seed_token(monkeypatch)
-    ctx = SimpleNamespace(
-        tool_name="run_shell_command",
-        arguments={"args": ["gh", "api", "/user"], "GITHUB_TOKEN": "secret"},
-        settings={},
-        correlation_id="call-1",
-        decline=MagicMock(),
-    )
+    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {})
+    ctx = _before_call_context("call-1")
 
     await hooks.prepare_brokered_tool_call(ctx)
 
-    assert ctx.arguments[hooks.AUDIT_HOST_ARGUMENT] == "api.github.com"
-    assert ctx.arguments[hooks.AUDIT_ROUTED_ARGUMENT] is True
-    assert hooks._audit_host_by_correlation["call-1"] == "api.github.com"
-    assert "GITHUB_TOKEN" not in ctx.arguments
+    assert hooks._audit_host_by_correlation == {"call-1": "api.github.com"}
     ctx.decline.assert_not_called()
 
 
 @pytest.mark.asyncio
-async def test_after_hook_writes_sanitized_audit_line(tmp_path: Path) -> None:
+async def test_before_hook_declines_brokered_call_when_no_session_can_be_minted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault_is_down(monkeypatch)
+    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {})
+    ctx = _before_call_context("call-1")
+
+    await hooks.prepare_brokered_tool_call(ctx)
+
+    ctx.decline.assert_called_once_with(hooks.SESSION_UNAVAILABLE)
+    assert hooks._audit_host_by_correlation == {}
+
+
+@pytest.mark.asyncio
+async def test_after_hook_writes_sanitized_audit_line(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-2": "api.github.com"})
     runtime_paths = RuntimePaths(
         config_path=tmp_path / "config.yaml",
         config_dir=tmp_path,
@@ -132,7 +199,7 @@ async def test_after_hook_writes_sanitized_audit_line(tmp_path: Path) -> None:
     )
     ctx = SimpleNamespace(
         tool_name="run_shell_command",
-        arguments={hooks.AUDIT_HOST_ARGUMENT: "api.github.com"},
+        arguments={"args": ["gh", "api", "/user"]},
         agent_name="code",
         runtime_paths=runtime_paths,
         result='{"login":"example"}',
@@ -149,46 +216,4 @@ async def test_after_hook_writes_sanitized_audit_line(tmp_path: Path) -> None:
     assert "github_pat_" not in line
     assert "ghp_" not in line
     assert "session-token" not in line
-
-
-@pytest.mark.asyncio
-async def test_brokered_shell_command_gets_proxy_env_without_github_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
-    _seed_token(monkeypatch)
-    monkeypatch.setenv("PATH", "/usr/bin")
-
-    changes = await _command_env_changes({"args": ["gh", "api", "/user"]})
-
-    assert changes["GITHUB_TOKEN"] is None
-    assert changes["GH_TOKEN"] is None
-    assert changes["HTTPS_PROXY"] == "https://127.0.0.1:14322"
-    assert changes["AGENT_VAULT_PROXY_TOKEN"] == "session-token"
-    assert changes["PATH"] == f"{PLUGIN_ROOT / 'bin'}:/usr/bin"
-
-
-@pytest.mark.asyncio
-async def test_shell_command_loses_github_tokens_when_no_session_can_be_minted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fail_to_mint(*_args: object, **_kwargs: object) -> SessionToken:
-        msg = "agent-vault is down"
-        raise RuntimeError(msg)
-
-    monkeypatch.setattr(hooks, "_session_token", None)
-    monkeypatch.setattr(hooks, "mint_proxy_session_token", fail_to_mint)
-
-    changes = await _command_env_changes({"args": ["gh", "api", "/user"]})
-
-    assert changes == {"GITHUB_TOKEN": None, "GH_TOKEN": None}
-
-
-@pytest.mark.asyncio
-async def test_other_tools_get_no_environment_changes(monkeypatch: pytest.MonkeyPatch) -> None:
-    _seed_token(monkeypatch)
-
-    changes = await _command_env_changes(
-        {"args": ["gh", "api", "/user"]},
-        function_name="run_python_code",
-        registered_toolkit="python",
-    )
-
-    assert changes == {}
+    assert hooks._audit_host_by_correlation == {}
