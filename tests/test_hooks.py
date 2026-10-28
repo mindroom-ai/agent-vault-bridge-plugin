@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import importlib.util
 import os
 import re
@@ -296,6 +297,11 @@ def _file_contents(root: Path) -> dict[Path, bytes]:
     return {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
 
 
+# What a no-follow open of a symbolic link raises: ELOOP for the log, and ENOTDIR on Linux for a directory on its path.
+_LINK_REFUSED = re.escape(os.strerror(errno.ELOOP))
+_DIRECTORY_LINK_REFUSED = f"{_LINK_REFUSED}|{re.escape(os.strerror(errno.ENOTDIR))}"
+
+
 def _link_audit_log(storage_root: Path, outside: Path) -> None:
     (_make_workspace(storage_root) / hooks.AUDIT_LOG_NAME).symlink_to(outside / "target.txt")
 
@@ -315,12 +321,12 @@ def _link_agent_directory(storage_root: Path, outside: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "plant_link",
+    ("plant_link", "refusal", "reason"),
     [
-        pytest.param(_link_audit_log, id="linked-log"),
-        pytest.param(_hard_link_audit_log, id="hard-linked-log"),
-        pytest.param(_link_workspace, id="linked-workspace"),
-        pytest.param(_link_agent_directory, id="linked-agent-directory"),
+        pytest.param(_link_audit_log, OSError, _LINK_REFUSED, id="linked-log"),
+        pytest.param(_hard_link_audit_log, RuntimeError, r"which has another hard link$", id="hard-linked-log"),
+        pytest.param(_link_workspace, OSError, _DIRECTORY_LINK_REFUSED, id="linked-workspace"),
+        pytest.param(_link_agent_directory, OSError, _DIRECTORY_LINK_REFUSED, id="linked-agent-directory"),
     ],
 )
 @pytest.mark.asyncio
@@ -328,8 +334,10 @@ async def test_after_hook_never_appends_through_a_link_worker_code_planted(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     plant_link: Callable[[Path, Path], None],
+    refusal: type[Exception],
+    reason: str,
 ) -> None:
-    """Worker code can write the agent's workspace, so a link there must not redirect the primary's append."""
+    """Worker code can write the agent's workspace, so the hook fails instead of appending through a link there."""
     storage_root = tmp_path / "mindroom_data"
     outside = tmp_path / "outside"
     (outside / "workspace").mkdir(parents=True)
@@ -344,7 +352,8 @@ async def test_after_hook_never_appends_through_a_link_worker_code_planted(
     before = _file_contents(tmp_path)
     monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-4": "api.github.com"})
 
-    await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-4"))
+    with pytest.raises(refusal, match=reason):
+        await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-4"))
 
     assert _file_contents(tmp_path) == before
     assert hooks._audit_host_by_correlation == {}
@@ -374,7 +383,8 @@ async def test_after_hook_refuses_a_log_swapped_for_a_link_after_the_directory_w
     monkeypatch.setattr(os, "open", open_after_swap)
     monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-5": "api.github.com"})
 
-    await hooks.audit_brokered_tool_call(_after_call_context(tmp_path / "mindroom_data", "call-5"))
+    with pytest.raises(OSError, match=_LINK_REFUSED):
+        await hooks.audit_brokered_tool_call(_after_call_context(tmp_path / "mindroom_data", "call-5"))
 
     assert swapped == [log_path]
     assert log_path.is_symlink()
@@ -382,7 +392,7 @@ async def test_after_hook_refuses_a_log_swapped_for_a_link_after_the_directory_w
     assert hooks._audit_host_by_correlation == {}
 
 
-def test_after_hook_skips_a_planted_fifo_without_waiting_for_a_reader(
+def test_after_hook_refuses_a_planted_fifo_without_waiting_for_a_reader(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -391,9 +401,15 @@ def test_after_hook_skips_a_planted_fifo_without_waiting_for_a_reader(
     fifo = _make_workspace(storage_root) / hooks.AUDIT_LOG_NAME
     os.mkfifo(fifo)
     monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-6": "api.github.com"})
-    hook_call = hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-6"))
-    hook_thread = threading.Thread(target=asyncio.run, args=(hook_call,), daemon=True)
+    refusals: list[OSError | RuntimeError] = []
 
+    def run_hook() -> None:
+        try:
+            asyncio.run(hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-6")))
+        except (OSError, RuntimeError) as refusal:
+            refusals.append(refusal)
+
+    hook_thread = threading.Thread(target=run_hook, daemon=True)
     hook_thread.start()
     hook_thread.join(timeout=5)
 
@@ -403,6 +419,7 @@ def test_after_hook_skips_a_planted_fifo_without_waiting_for_a_reader(
         hook_thread.join(timeout=5)
         os.close(reader)
         pytest.fail("the audit hook blocked opening a FIFO that has no reader")
+    assert [refusal.errno for refusal in refusals if isinstance(refusal, OSError)] == [errno.ENXIO]
     assert hooks._audit_host_by_correlation == {}
 
 
@@ -418,7 +435,8 @@ async def test_after_hook_writes_nothing_into_a_planted_fifo_with_a_reader(
     monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-7": "api.github.com"})
 
     try:
-        await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-7"))
+        with pytest.raises(RuntimeError, match=r"which is not a regular file$"):
+            await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-7"))
         received = os.read(reader, 4096)
     finally:
         os.close(reader)
@@ -441,7 +459,8 @@ async def test_after_hook_appends_again_once_a_planted_link_is_removed(
     log_path = storage_root / "agents" / "code" / "workspace" / hooks.AUDIT_LOG_NAME
     monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-8": "api.github.com", "call-9": "api.github.com"})
 
-    await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-8"))
+    with pytest.raises(OSError, match=_LINK_REFUSED):
+        await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-8"))
     log_path.unlink()
     await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-9"))
 

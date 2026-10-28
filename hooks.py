@@ -177,10 +177,7 @@ async def audit_brokered_tool_call(ctx: ToolAfterCallContext) -> None:
     if _contains_github_token(line):
         msg = "agent-vault-bridge refused to write an audit line containing a GitHub token"
         raise RuntimeError(msg)
-    try:
-        _append_audit_line(ctx.runtime_paths.storage_root, ctx.agent_name, line)
-    except (OSError, ValueError) as exc:
-        ctx.logger.warning("agent-vault-bridge skipped an audit line", agent_name=ctx.agent_name, error=str(exc))
+    _append_audit_line(ctx.runtime_paths.storage_root, ctx.agent_name, line)
 
 
 def _session_token_or_decline(
@@ -246,10 +243,10 @@ def _is_gh_api_call(args: tuple[str, ...]) -> bool:
 
 
 def _append_audit_line(storage_root: Path, agent_name: str, line: str) -> None:
-    """Append one line to the agent's audit log, refusing a link anywhere below the storage root.
+    """Append one line to the agent's audit log, raising instead when a link sits anywhere below the storage root.
 
     The log must be a regular file with no other hard link, as MindRoom requires of workspace files the primary writes,
-    so the append never changes a file outside the workspace.
+    so the append never changes a file outside the workspace. MindRoom logs a refused append as a failed hook.
     """
     with open_directory_within_root(storage_root, Path("agents", agent_name, "workspace"), create=True) as workspace_fd:
         descriptor = os.open(AUDIT_LOG_NAME, _AUDIT_LOG_FLAGS, 0o666, dir_fd=workspace_fd)
@@ -258,8 +255,8 @@ def _append_audit_line(storage_root: Path, agent_name: str, line: str) -> None:
     if not stat.S_ISREG(file_status.st_mode) or hard_linked:
         os.close(descriptor)
         reason = "has another hard link" if hard_linked else "is not a regular file"
-        msg = f"{AUDIT_LOG_NAME} {reason}"
-        raise ValueError(msg)
+        msg = f"agent-vault-bridge refused to append to {AUDIT_LOG_NAME}, which {reason}"
+        raise RuntimeError(msg)
     with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
         handle.write(line)
 
