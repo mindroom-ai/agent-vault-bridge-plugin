@@ -237,18 +237,16 @@ async def test_before_hook_declines_brokered_call_when_no_session_can_be_minted(
     assert hooks._audit_host_by_correlation == {}
 
 
-@pytest.mark.asyncio
-async def test_after_hook_writes_sanitized_audit_line(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-2": "api.github.com"})
+def _after_call_context(storage_root: Path, correlation_id: str) -> ToolAfterCallContext:
     runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "mindroom_data",
+        config_path=storage_root.parent / "config.yaml",
+        config_dir=storage_root.parent,
+        env_path=storage_root.parent / ".env",
+        storage_root=storage_root,
         process_env={},
         env_file_values={},
     )
-    ctx = ToolAfterCallContext(
+    return ToolAfterCallContext(
         tool_name="run_shell_command",
         arguments={"args": ["gh", "api", "/user"]},
         agent_name="code",
@@ -261,15 +259,78 @@ async def test_after_hook_writes_sanitized_audit_line(monkeypatch: pytest.Monkey
         blocked=False,
         duration_ms=1.0,
         runtime_paths=runtime_paths,
-        correlation_id="call-2",
+        correlation_id=correlation_id,
     )
 
-    await hooks.audit_brokered_tool_call(ctx)
 
-    log_path = runtime_paths.storage_root / "agents" / "code" / "workspace" / hooks.AUDIT_LOG_NAME
-    line = log_path.read_text(encoding="utf-8")
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z shell success api\.github\.com\n", line)
-    assert "github_pat_" not in line
-    assert "ghp_" not in line
-    assert "session-token" not in line
+@pytest.mark.asyncio
+async def test_after_hook_writes_sanitized_audit_line(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    storage_root = tmp_path / "mindroom_data"
+    storage_root.mkdir()
+    log_path = storage_root / "agents" / "code" / "workspace" / hooks.AUDIT_LOG_NAME
+    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-2": "api.github.com", "call-3": "api.github.com"})
+
+    await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-2"))
+    await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-3"))
+
+    lines = log_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    assert len(lines) == 2
+    for line in lines:
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z shell success api\.github\.com\n", line)
+        assert "github_pat_" not in line
+        assert "ghp_" not in line
+        assert "session-token" not in line
+    assert hooks._audit_host_by_correlation == {}
+
+
+def _link_audit_log(storage_root: Path, outside: Path) -> None:
+    workspace = storage_root / "agents" / "code" / "workspace"
+    workspace.mkdir(parents=True)
+    (workspace / hooks.AUDIT_LOG_NAME).symlink_to(outside / "target.txt")
+
+
+def _link_workspace(storage_root: Path, outside: Path) -> None:
+    (storage_root / "agents" / "code").mkdir(parents=True)
+    (storage_root / "agents" / "code" / "workspace").symlink_to(outside, target_is_directory=True)
+
+
+def _link_agent_directory(storage_root: Path, outside: Path) -> None:
+    (storage_root / "agents").mkdir()
+    (storage_root / "agents" / "code").symlink_to(outside, target_is_directory=True)
+
+
+@pytest.mark.parametrize(
+    "plant_link",
+    [
+        pytest.param(_link_audit_log, id="linked-log"),
+        pytest.param(_link_workspace, id="linked-workspace"),
+        pytest.param(_link_agent_directory, id="linked-agent-directory"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_after_hook_never_appends_through_a_link_worker_code_planted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    plant_link: Callable[[Path, Path], None],
+) -> None:
+    """Worker code can write the agent's workspace, so a link there must not redirect the primary's append."""
+    storage_root = tmp_path / "mindroom_data"
+    storage_root.mkdir()
+    outside = tmp_path / "outside"
+    (outside / "workspace").mkdir(parents=True)
+    # Files the primary can write that each link would reach: a named file, and the log name through a linked directory.
+    for target in (
+        outside / "target.txt",
+        outside / hooks.AUDIT_LOG_NAME,
+        outside / "workspace" / hooks.AUDIT_LOG_NAME,
+    ):
+        target.write_text("primary-owned\n", encoding="utf-8")
+    before = {path: path.read_bytes() for path in outside.rglob("*") if path.is_file()}
+    plant_link(storage_root, outside)
+    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-4": "api.github.com"})
+
+    await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-4"))
+
+    assert {path: path.read_bytes() for path in outside.rglob("*") if path.is_file()} == before
+    assert not [path for path in storage_root.rglob("*") if path.is_file() and not path.is_symlink()]
     assert hooks._audit_host_by_correlation == {}
