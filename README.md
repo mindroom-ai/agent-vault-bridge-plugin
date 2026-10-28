@@ -20,7 +20,7 @@ The plugin gates `run_shell_command` invocations that target brokered hosts (e.g
 - Mints short-TTL `proxy`-role session tokens from Agent Vault and supplies them via `Proxy-Authorization` to the local HTTPS proxy
 - Ships a tiny `gh-via-broker` shell wrapper that adapts `gh api <endpoint>` to the proxy + auth header convention
 - Writes a one-line audit record per brokered call to `<workspace>/agent-vault-bridge.log` (no tokens, no bodies)
-- Idempotent — safe to hot-reload while MindRoom is running
+- Safe to hot-reload while MindRoom is running, except once when updating from a version that patched MindRoom (see Install)
 
 ## Architecture
 
