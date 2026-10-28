@@ -149,7 +149,7 @@ Restart MindRoom once after updating from one of them.
 
 ## Limitations and Known Trade-offs
 
-- Only shell commands lose `GITHUB_TOKEN` and `GH_TOKEN`. Other tools that run in MindRoom's process, such as `python`, still see them, because MindRoom fully trusts code those tools run in its process; list such tools in the agent's `worker_tools` to keep the tokens away from them.
+- Only shell commands lose `GITHUB_TOKEN` and `GH_TOKEN`. Other tools that run in MindRoom's process, such as `python`, still see them, because MindRoom fully trusts code those tools run in its process; list such tools in the agent's `worker_tools` to keep MindRoom's own tokens away from them, which holds as long as the worker's environment does not set `GITHUB_TOKEN` or `GH_TOKEN` itself.
 - The `gh-via-broker` shim only handles the `gh api <endpoint>` form. Other `gh` subcommands fall through with a clear stderr message.
 - Hosts not on `brokered_hosts` are not gated; agents can still call them directly without the proxy.
 - Bootstrap uses `docker exec` to mint session tokens — this requires the MindRoom process to have rights to run `docker exec` against the `agent-vault` container.
