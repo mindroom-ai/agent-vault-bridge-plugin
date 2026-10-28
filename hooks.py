@@ -243,7 +243,7 @@ def _is_gh_api_call(args: tuple[str, ...]) -> bool:
 
 
 def _append_audit_line(storage_root: Path, agent_name: str, line: str) -> None:
-    """Append one line to the agent's audit log, raising instead when a link sits anywhere below the storage root.
+    """Append one line to the agent's audit log, raising when the log or a directory on its path is a link.
 
     The log must be a regular file with no other hard link, as MindRoom requires of workspace files the primary writes,
     so the append never changes a file outside the workspace. MindRoom logs a refused append as a failed hook.
