@@ -5,17 +5,14 @@ from __future__ import annotations
 
 import asyncio
 import errno
-import importlib.util
 import os
 import re
-import sys
 import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from mindroom import plugin_api
 from mindroom.constants import RuntimePaths
 from mindroom.hooks import HookRegistry, emit_collect_environment
 from mindroom.plugin_api import ToolAfterCallContext, ToolBeforeCallContext, ToolEnvironmentContext
@@ -175,31 +172,6 @@ async def test_github_tokens_are_stripped_even_when_the_broker_hook_fails(
     changes = await _collect_environment(plugin_registry, {"args": ["gh", "api", "/user"]})
 
     assert changes == ({"GITHUB_TOKEN": None, "GH_TOKEN": None}, (), None)
-
-
-@pytest.mark.parametrize(
-    "make_older",
-    [
-        pytest.param(lambda mp: mp.delattr(ToolEnvironmentContext, "decline"), id="no-decline"),
-        pytest.param(lambda mp: mp.delattr(ToolEnvironmentContext, "prepend_path"), id="no-prepend-path"),
-        pytest.param(lambda mp: mp.delattr(plugin_api, "EVENT_TOOL_ENVIRONMENT"), id="no-environment-hook"),
-        pytest.param(lambda mp: mp.setitem(sys.modules, "mindroom.plugin_api", None), id="no-plugin-api"),
-    ],
-)
-def test_plugin_refuses_to_load_on_an_older_mindroom(
-    monkeypatch: pytest.MonkeyPatch,
-    make_older: Callable[[pytest.MonkeyPatch], None],
-) -> None:
-    """Every older MindRoom gets the minimum release, instead of a bare import error or brokered calls run unproxied."""
-    make_older(monkeypatch)
-    module_name = f"{hooks.__package__}.hooks_on_older_mindroom"
-    spec = importlib.util.spec_from_file_location(module_name, PLUGIN_ROOT / "hooks.py")
-    assert spec is not None
-    assert spec.loader is not None
-
-    minimum = re.escape(f"needs MindRoom {hooks.MINIMUM_MINDROOM_RELEASE} or later")
-    with pytest.raises(ImportError, match=f"^agent-vault-bridge {minimum}, "):
-        spec.loader.exec_module(importlib.util.module_from_spec(spec))
 
 
 def _before_call_context(correlation_id: str) -> ToolBeforeCallContext:

@@ -103,12 +103,11 @@ To broker additional services, add the host to `brokered_hosts` and add the corr
 
 ## Prerequisites
 
-1. **MindRoom v2026.10.617 or later**, whose `tool:environment` hook can decline a call and put the shim directory first on `PATH`.
-2. **A reachable Agent Vault** (local or remote) with the target service registered and a credential set. The management API and HTTPS proxy ports must be directly reachable from the MindRoom host — the proxy speaks HTTP CONNECT, which cannot sit behind a normal reverse proxy.
-3. **CA cert** fetched once (`agent-vault ca fetch --address <api-url>`) and placed at the configured `ca_path` (mode 0644).
-4. **A token source**: either a local Docker container named `agent-vault` (`bootstrap.method: docker_exec`), or a proxy-role agent token file (`bootstrap.method: token_file`) for remote vaults.
+1. **A reachable Agent Vault** (local or remote) with the target service registered and a credential set. The management API and HTTPS proxy ports must be directly reachable from the MindRoom host — the proxy speaks HTTP CONNECT, which cannot sit behind a normal reverse proxy.
+2. **CA cert** fetched once (`agent-vault ca fetch --address <api-url>`) and placed at the configured `ca_path` (mode 0644).
+3. **A token source**: either a local Docker container named `agent-vault` (`bootstrap.method: docker_exec`), or a proxy-role agent token file (`bootstrap.method: token_file`) for remote vaults.
 
-A NixOS module that wires the last three is available at `mindroom/configs/nixos/optional/agent-vault.nix`.
+A NixOS module that wires these is available at `mindroom/configs/nixos/optional/agent-vault.nix`.
 
 ## Install
 

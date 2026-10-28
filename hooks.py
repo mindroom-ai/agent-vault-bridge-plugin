@@ -10,36 +10,20 @@ from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .vault_client import BootstrapSettings, SessionToken, VaultSettings, mint_proxy_session_token
-
-MINIMUM_MINDROOM_RELEASE = "v2026.10.617"
-_NEEDS_NEWER_MINDROOM = (
-    f"agent-vault-bridge needs MindRoom {MINIMUM_MINDROOM_RELEASE} or later, "
-    "whose tool:environment hook can decline a call and put a directory first on PATH"
+from mindroom.plugin_api import (
+    EVENT_BOT_READY,
+    EVENT_TOOL_AFTER_CALL,
+    EVENT_TOOL_BEFORE_CALL,
+    EVENT_TOOL_ENVIRONMENT,
+    AgentLifecycleContext,
+    ToolAfterCallContext,
+    ToolBeforeCallContext,
+    ToolEnvironmentContext,
+    hook,
+    open_directory_within_root,
 )
 
-# An older MindRoom lacks `mindroom.plugin_api`, the tool:environment hook, or its decline() and prepend_path(), and
-# without them a brokered command would run without the proxy. MindRoom has no plugin-API version marker, so the
-# plugin refuses to load when any of them is missing.
-try:
-    from mindroom.plugin_api import (
-        EVENT_BOT_READY,
-        EVENT_TOOL_AFTER_CALL,
-        EVENT_TOOL_BEFORE_CALL,
-        EVENT_TOOL_ENVIRONMENT,
-        AgentLifecycleContext,
-        ToolAfterCallContext,
-        ToolBeforeCallContext,
-        ToolEnvironmentContext,
-        hook,
-        open_directory_within_root,
-    )
-except ImportError as exc:
-    if exc.name != "mindroom.plugin_api":
-        raise
-    raise ImportError(_NEEDS_NEWER_MINDROOM) from exc
-if not all(hasattr(ToolEnvironmentContext, method) for method in ("decline", "prepend_path")):
-    raise ImportError(_NEEDS_NEWER_MINDROOM)
+from .vault_client import BootstrapSettings, SessionToken, VaultSettings, mint_proxy_session_token
 
 PLUGIN_NAME = "agent-vault-bridge"
 TOKEN_ENV_NAME = "AGENT_VAULT_PROXY_TOKEN"
