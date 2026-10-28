@@ -5,18 +5,22 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock
+from typing import TYPE_CHECKING
 
 import pytest
+from mindroom import plugin_api
 from mindroom.constants import RuntimePaths
 from mindroom.hooks import HookRegistry, emit_collect_environment
-from mindroom.plugin_api import ToolEnvironmentContext
+from mindroom.plugin_api import ToolAfterCallContext, ToolBeforeCallContext, ToolEnvironmentContext
 
 from agent_vault_bridge_test_import import hooks
 from agent_vault_bridge_test_import.vault_client import SessionToken
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 _CA_PATH = "/etc/ssl/agent-vault-ca.pem"
@@ -150,30 +154,60 @@ async def test_other_tools_get_no_environment_changes(
     assert changes == ({}, (), None)
 
 
-@pytest.mark.parametrize("method", ["decline", "prepend_path"])
-def test_plugin_refuses_to_load_on_a_mindroom_without_the_hook_methods(
+@pytest.mark.asyncio
+async def test_github_tokens_are_stripped_even_when_the_broker_hook_fails(
     monkeypatch: pytest.MonkeyPatch,
-    method: str,
+    plugin_registry: HookRegistry,
 ) -> None:
-    """On an older MindRoom, loading fails with the minimum release instead of brokered calls running unproxied."""
-    monkeypatch.delattr(ToolEnvironmentContext, method)
+    """Stripping is a hook of its own, so the removals survive a broker hook that raises."""
+    _seed_token(monkeypatch)
+
+    def broken_proxy_env(*_args: object) -> dict[str, str]:
+        msg = "broker hook bug"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(hooks, "_proxy_env", broken_proxy_env)
+
+    changes = await _collect_environment(plugin_registry, {"args": ["gh", "api", "/user"]})
+
+    assert changes == ({"GITHUB_TOKEN": None, "GH_TOKEN": None}, (), None)
+
+
+@pytest.mark.parametrize(
+    "make_older",
+    [
+        pytest.param(lambda mp: mp.delattr(ToolEnvironmentContext, "decline"), id="no-decline"),
+        pytest.param(lambda mp: mp.delattr(ToolEnvironmentContext, "prepend_path"), id="no-prepend-path"),
+        pytest.param(lambda mp: mp.delattr(plugin_api, "EVENT_TOOL_ENVIRONMENT"), id="no-environment-hook"),
+        pytest.param(lambda mp: mp.setitem(sys.modules, "mindroom.plugin_api", None), id="no-plugin-api"),
+    ],
+)
+def test_plugin_refuses_to_load_on_an_older_mindroom(
+    monkeypatch: pytest.MonkeyPatch,
+    make_older: Callable[[pytest.MonkeyPatch], None],
+) -> None:
+    """Every older MindRoom gets the minimum release, instead of a bare import error or brokered calls run unproxied."""
+    make_older(monkeypatch)
     module_name = f"{hooks.__package__}.hooks_on_older_mindroom"
     spec = importlib.util.spec_from_file_location(module_name, PLUGIN_ROOT / "hooks.py")
     assert spec is not None
     assert spec.loader is not None
 
-    with pytest.raises(ImportError, match=r"needs the first MindRoom release after v2026\.10\.614 or newer"):
+    minimum = re.escape(f"needs MindRoom {hooks.MINIMUM_MINDROOM_RELEASE} or later")
+    with pytest.raises(ImportError, match=f"^agent-vault-bridge {minimum}, "):
         spec.loader.exec_module(importlib.util.module_from_spec(spec))
 
 
-def _before_call_context(correlation_id: str) -> SimpleNamespace:
-    return SimpleNamespace(
+def _before_call_context(correlation_id: str) -> ToolBeforeCallContext:
+    return ToolBeforeCallContext(
         tool_name="run_shell_command",
         arguments={"args": ["gh", "api", "/user"]},
-        settings={},
+        agent_name="code",
+        room_id=None,
+        thread_id=None,
+        requester_id=None,
+        session_id=None,
         correlation_id=correlation_id,
-        decline=MagicMock(),
-        logger=MagicMock(),
     )
 
 
@@ -186,7 +220,7 @@ async def test_before_hook_marks_brokered_call_for_audit(monkeypatch: pytest.Mon
     await hooks.prepare_brokered_tool_call(ctx)
 
     assert hooks._audit_host_by_correlation == {"call-1": "api.github.com"}
-    ctx.decline.assert_not_called()
+    assert not ctx.declined
 
 
 @pytest.mark.asyncio
@@ -199,7 +233,7 @@ async def test_before_hook_declines_brokered_call_when_no_session_can_be_minted(
 
     await hooks.prepare_brokered_tool_call(ctx)
 
-    ctx.decline.assert_called_once_with(hooks.SESSION_UNAVAILABLE)
+    assert (ctx.declined, ctx.decline_reason) == (True, hooks.SESSION_UNAVAILABLE)
     assert hooks._audit_host_by_correlation == {}
 
 
@@ -214,14 +248,19 @@ async def test_after_hook_writes_sanitized_audit_line(monkeypatch: pytest.Monkey
         process_env={},
         env_file_values={},
     )
-    ctx = SimpleNamespace(
+    ctx = ToolAfterCallContext(
         tool_name="run_shell_command",
         arguments={"args": ["gh", "api", "/user"]},
         agent_name="code",
-        runtime_paths=runtime_paths,
+        room_id=None,
+        thread_id=None,
+        requester_id=None,
+        session_id=None,
         result='{"login":"example"}',
         error=None,
         blocked=False,
+        duration_ms=1.0,
+        runtime_paths=runtime_paths,
         correlation_id="call-2",
     )
 

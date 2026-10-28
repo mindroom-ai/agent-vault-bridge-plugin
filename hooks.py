@@ -8,28 +8,35 @@ from collections.abc import Mapping
 from pathlib import Path
 from urllib.parse import urlparse
 
-from mindroom.plugin_api import (
-    EVENT_BOT_READY,
-    EVENT_TOOL_AFTER_CALL,
-    EVENT_TOOL_BEFORE_CALL,
-    EVENT_TOOL_ENVIRONMENT,
-    AgentLifecycleContext,
-    ToolAfterCallContext,
-    ToolBeforeCallContext,
-    ToolEnvironmentContext,
-    hook,
-)
-
 from .vault_client import BootstrapSettings, SessionToken, VaultSettings, mint_proxy_session_token
 
-# Without these, a brokered command would run without the proxy. MindRoom has no plugin-API version marker and the
-# release that adds them has no tag yet, so the check looks for the methods themselves.
-if not all(hasattr(ToolEnvironmentContext, method) for method in ("decline", "prepend_path")):
-    msg = (
-        "agent-vault-bridge needs the first MindRoom release after v2026.10.614 or newer, "
-        "whose tool:environment hook can decline a call and put a directory first on PATH"
+MINIMUM_MINDROOM_RELEASE = "v2026.10.617"
+_NEEDS_NEWER_MINDROOM = (
+    f"agent-vault-bridge needs MindRoom {MINIMUM_MINDROOM_RELEASE} or later, "
+    "whose tool:environment hook can decline a call and put a directory first on PATH"
+)
+
+# An older MindRoom lacks `mindroom.plugin_api`, the tool:environment hook, or its decline() and prepend_path(), and
+# without them a brokered command would run without the proxy. MindRoom has no plugin-API version marker, so the
+# plugin refuses to load when any of them is missing.
+try:
+    from mindroom.plugin_api import (
+        EVENT_BOT_READY,
+        EVENT_TOOL_AFTER_CALL,
+        EVENT_TOOL_BEFORE_CALL,
+        EVENT_TOOL_ENVIRONMENT,
+        AgentLifecycleContext,
+        ToolAfterCallContext,
+        ToolBeforeCallContext,
+        ToolEnvironmentContext,
+        hook,
     )
-    raise ImportError(msg)
+except ImportError as exc:
+    if exc.name != "mindroom.plugin_api":
+        raise
+    raise ImportError(_NEEDS_NEWER_MINDROOM) from exc
+if not all(hasattr(ToolEnvironmentContext, method) for method in ("decline", "prepend_path")):
+    raise ImportError(_NEEDS_NEWER_MINDROOM)
 
 PLUGIN_NAME = "agent-vault-bridge"
 TOKEN_ENV_NAME = "AGENT_VAULT_PROXY_TOKEN"
@@ -107,7 +114,11 @@ async def prime_agent_vault_session(ctx: AgentLifecycleContext) -> None:
 
 @hook(EVENT_TOOL_BEFORE_CALL, name="agent-vault-bridge-before", priority=20, timeout_ms=5000)
 async def prepare_brokered_tool_call(ctx: ToolBeforeCallContext) -> None:
-    """Decline a brokered shell call before any approval when no proxy session is available; else mark it for audit."""
+    """Decline a brokered shell call when no proxy session is available, and otherwise mark it for the audit log.
+
+    A background script's call asks for approval after this hook, so it is refused before anyone is asked; a call in a
+    reply that needs approval runs its hooks only once it is approved.
+    """
     settings = resolve_settings(ctx.settings)
     host = brokered_host_for_call(ctx.tool_name, ctx.arguments, settings)
     if host is None:
