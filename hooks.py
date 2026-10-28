@@ -246,12 +246,19 @@ def _is_gh_api_call(args: tuple[str, ...]) -> bool:
 
 
 def _append_audit_line(storage_root: Path, agent_name: str, line: str) -> None:
-    """Append one line to the agent's audit log, refusing a link anywhere below the storage root."""
+    """Append one line to the agent's audit log, refusing a link anywhere below the storage root.
+
+    The log must be a regular file with no other hard link, as MindRoom requires of workspace files the primary writes,
+    so the append never changes a file outside the workspace.
+    """
     with open_directory_within_root(storage_root, Path("agents", agent_name, "workspace"), create=True) as workspace_fd:
         descriptor = os.open(AUDIT_LOG_NAME, _AUDIT_LOG_FLAGS, 0o666, dir_fd=workspace_fd)
-    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+    file_status = os.fstat(descriptor)
+    hard_linked = file_status.st_nlink > 1
+    if not stat.S_ISREG(file_status.st_mode) or hard_linked:
         os.close(descriptor)
-        msg = f"{AUDIT_LOG_NAME} is not a regular file"
+        reason = "has another hard link" if hard_linked else "is not a regular file"
+        msg = f"{AUDIT_LOG_NAME} {reason}"
         raise ValueError(msg)
     with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
         handle.write(line)
