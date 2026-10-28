@@ -3,9 +3,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import errno
 import importlib.util
+import os
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -237,18 +241,16 @@ async def test_before_hook_declines_brokered_call_when_no_session_can_be_minted(
     assert hooks._audit_host_by_correlation == {}
 
 
-@pytest.mark.asyncio
-async def test_after_hook_writes_sanitized_audit_line(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-2": "api.github.com"})
+def _after_call_context(storage_root: Path, correlation_id: str) -> ToolAfterCallContext:
     runtime_paths = RuntimePaths(
-        config_path=tmp_path / "config.yaml",
-        config_dir=tmp_path,
-        env_path=tmp_path / ".env",
-        storage_root=tmp_path / "mindroom_data",
+        config_path=storage_root.parent / "config.yaml",
+        config_dir=storage_root.parent,
+        env_path=storage_root.parent / ".env",
+        storage_root=storage_root,
         process_env={},
         env_file_values={},
     )
-    ctx = ToolAfterCallContext(
+    return ToolAfterCallContext(
         tool_name="run_shell_command",
         arguments={"args": ["gh", "api", "/user"]},
         agent_name="code",
@@ -261,15 +263,207 @@ async def test_after_hook_writes_sanitized_audit_line(monkeypatch: pytest.Monkey
         blocked=False,
         duration_ms=1.0,
         runtime_paths=runtime_paths,
-        correlation_id="call-2",
+        correlation_id=correlation_id,
     )
 
-    await hooks.audit_brokered_tool_call(ctx)
 
-    log_path = runtime_paths.storage_root / "agents" / "code" / "workspace" / hooks.AUDIT_LOG_NAME
-    line = log_path.read_text(encoding="utf-8")
-    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z shell success api\.github\.com\n", line)
-    assert "github_pat_" not in line
-    assert "ghp_" not in line
-    assert "session-token" not in line
+@pytest.mark.asyncio
+async def test_after_hook_writes_sanitized_audit_line(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    storage_root = tmp_path / "mindroom_data"
+    storage_root.mkdir()
+    log_path = storage_root / "agents" / "code" / "workspace" / hooks.AUDIT_LOG_NAME
+    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-2": "api.github.com", "call-3": "api.github.com"})
+
+    await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-2"))
+    await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-3"))
+
+    lines = log_path.read_text(encoding="utf-8").splitlines(keepends=True)
+    assert len(lines) == 2
+    for line in lines:
+        assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z shell success api\.github\.com\n", line)
+        assert "github_pat_" not in line
+        assert "ghp_" not in line
+        assert "session-token" not in line
+    assert hooks._audit_host_by_correlation == {}
+
+
+def _make_workspace(storage_root: Path) -> Path:
+    workspace = storage_root / "agents" / "code" / "workspace"
+    workspace.mkdir(parents=True)
+    return workspace
+
+
+def _file_contents(root: Path) -> dict[Path, bytes]:
+    return {path: path.read_bytes() for path in root.rglob("*") if path.is_file()}
+
+
+# What a no-follow open of a symbolic link raises: ELOOP for the log, and ENOTDIR on Linux for a directory on its path.
+_LINK_REFUSED = re.escape(os.strerror(errno.ELOOP))
+_DIRECTORY_LINK_REFUSED = f"{_LINK_REFUSED}|{re.escape(os.strerror(errno.ENOTDIR))}"
+
+
+def _link_audit_log(storage_root: Path, outside: Path) -> None:
+    (_make_workspace(storage_root) / hooks.AUDIT_LOG_NAME).symlink_to(outside / "target.txt")
+
+
+def _hard_link_audit_log(storage_root: Path, outside: Path) -> None:
+    (_make_workspace(storage_root) / hooks.AUDIT_LOG_NAME).hardlink_to(outside / "target.txt")
+
+
+def _link_workspace(storage_root: Path, outside: Path) -> None:
+    (storage_root / "agents" / "code").mkdir(parents=True)
+    (storage_root / "agents" / "code" / "workspace").symlink_to(outside, target_is_directory=True)
+
+
+def _link_agent_directory(storage_root: Path, outside: Path) -> None:
+    (storage_root / "agents").mkdir(parents=True)
+    (storage_root / "agents" / "code").symlink_to(outside, target_is_directory=True)
+
+
+@pytest.mark.parametrize(
+    ("plant_link", "refusal", "reason"),
+    [
+        pytest.param(_link_audit_log, OSError, _LINK_REFUSED, id="linked-log"),
+        pytest.param(_hard_link_audit_log, RuntimeError, r"which has another hard link$", id="hard-linked-log"),
+        pytest.param(_link_workspace, OSError, _DIRECTORY_LINK_REFUSED, id="linked-workspace"),
+        pytest.param(_link_agent_directory, OSError, _DIRECTORY_LINK_REFUSED, id="linked-agent-directory"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_after_hook_never_appends_through_a_link_worker_code_planted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    plant_link: Callable[[Path, Path], None],
+    refusal: type[Exception],
+    reason: str,
+) -> None:
+    """Worker code can write the agent's workspace, so the hook fails instead of appending through a link there."""
+    storage_root = tmp_path / "mindroom_data"
+    outside = tmp_path / "outside"
+    (outside / "workspace").mkdir(parents=True)
+    # Files the primary can write that each link would reach: a named file, and the log name through a linked directory.
+    for target in (
+        outside / "target.txt",
+        outside / hooks.AUDIT_LOG_NAME,
+        outside / "workspace" / hooks.AUDIT_LOG_NAME,
+    ):
+        target.write_text("primary-owned\n", encoding="utf-8")
+    plant_link(storage_root, outside)
+    before = _file_contents(tmp_path)
+    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-4": "api.github.com"})
+
+    with pytest.raises(refusal, match=reason):
+        await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-4"))
+
+    assert _file_contents(tmp_path) == before
+    assert hooks._audit_host_by_correlation == {}
+
+
+@pytest.mark.asyncio
+async def test_after_hook_refuses_a_log_swapped_for_a_link_after_the_directory_walk(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Worker code can swap the log for a link between the walk and the open, so the open itself must refuse it."""
+    workspace = _make_workspace(tmp_path / "mindroom_data")
+    log_path = workspace / hooks.AUDIT_LOG_NAME
+    log_path.write_text("earlier line\n", encoding="utf-8")
+    target = tmp_path / "target.txt"
+    target.write_text("primary-owned\n", encoding="utf-8")
+    real_open = os.open
+    swapped: list[Path] = []
+
+    def open_after_swap(path: str, flags: int, mode: int = 0o777, *, dir_fd: int | None = None) -> int:
+        if path == hooks.AUDIT_LOG_NAME and not swapped:
+            staged = workspace / "staged-link"
+            staged.symlink_to(target)
+            swapped.append(staged.replace(log_path))
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, "open", open_after_swap)
+    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-5": "api.github.com"})
+
+    with pytest.raises(OSError, match=_LINK_REFUSED):
+        await hooks.audit_brokered_tool_call(_after_call_context(tmp_path / "mindroom_data", "call-5"))
+
+    assert swapped == [log_path]
+    assert log_path.is_symlink()
+    assert target.read_text(encoding="utf-8") == "primary-owned\n"
+    assert hooks._audit_host_by_correlation == {}
+
+
+def test_after_hook_refuses_a_planted_fifo_without_waiting_for_a_reader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A blocking open would stall the event loop, which the hook's timeout cannot interrupt."""
+    storage_root = tmp_path / "mindroom_data"
+    fifo = _make_workspace(storage_root) / hooks.AUDIT_LOG_NAME
+    os.mkfifo(fifo)
+    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-6": "api.github.com"})
+    refusals: list[OSError | RuntimeError] = []
+
+    def run_hook() -> None:
+        try:
+            asyncio.run(hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-6")))
+        except (OSError, RuntimeError) as refusal:
+            refusals.append(refusal)
+
+    hook_thread = threading.Thread(target=run_hook, daemon=True)
+    hook_thread.start()
+    hook_thread.join(timeout=5)
+
+    if hook_thread.is_alive():
+        # Open a reader to release the blocked open, so the regression fails instead of hanging the run.
+        reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        hook_thread.join(timeout=5)
+        os.close(reader)
+        pytest.fail("the audit hook blocked opening a FIFO that has no reader")
+    assert [refusal.errno for refusal in refusals if isinstance(refusal, OSError)] == [errno.ENXIO]
+    assert hooks._audit_host_by_correlation == {}
+
+
+@pytest.mark.asyncio
+async def test_after_hook_writes_nothing_into_a_planted_fifo_with_a_reader(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage_root = tmp_path / "mindroom_data"
+    fifo = _make_workspace(storage_root) / hooks.AUDIT_LOG_NAME
+    os.mkfifo(fifo)
+    reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-7": "api.github.com"})
+
+    try:
+        with pytest.raises(RuntimeError, match=r"which is not a regular file$"):
+            await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-7"))
+        received = os.read(reader, 4096)
+    finally:
+        os.close(reader)
+
+    assert received == b""
+    assert hooks._audit_host_by_correlation == {}
+
+
+@pytest.mark.asyncio
+async def test_after_hook_appends_again_once_a_planted_link_is_removed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    storage_root = tmp_path / "mindroom_data"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "target.txt"
+    target.write_text("primary-owned\n", encoding="utf-8")
+    _link_audit_log(storage_root, outside)
+    log_path = storage_root / "agents" / "code" / "workspace" / hooks.AUDIT_LOG_NAME
+    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-8": "api.github.com", "call-9": "api.github.com"})
+
+    with pytest.raises(OSError, match=_LINK_REFUSED):
+        await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-8"))
+    log_path.unlink()
+    await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-9"))
+
+    assert re.fullmatch(r"\S+ shell success api\.github\.com\n", log_path.read_text(encoding="utf-8"))
+    assert target.read_text(encoding="utf-8") == "primary-owned\n"
     assert hooks._audit_host_by_correlation == {}

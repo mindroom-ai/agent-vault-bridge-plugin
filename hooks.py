@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -30,6 +32,7 @@ try:
         ToolBeforeCallContext,
         ToolEnvironmentContext,
         hook,
+        open_directory_within_root,
     )
 except ImportError as exc:
     if exc.name != "mindroom.plugin_api":
@@ -42,6 +45,9 @@ PLUGIN_NAME = "agent-vault-bridge"
 TOKEN_ENV_NAME = "AGENT_VAULT_PROXY_TOKEN"
 CA_ENV_NAME = "AGENT_VAULT_CA_PATH"
 AUDIT_LOG_NAME = "agent-vault-bridge.log"
+# Worker code can write the agent's workspace, so the log is opened without following a link, and without blocking on a
+# planted FIFO.
+_AUDIT_LOG_FLAGS = os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
 SECRET_ENV_NAMES = ("GITHUB_TOKEN", "GH_TOKEN")
 # The shims a brokered command finds first on PATH, so `gh` and `curl` send the proxy session.
 SHIM_DIR = str(Path(__file__).resolve().parent / "bin")
@@ -166,15 +172,12 @@ async def audit_brokered_tool_call(ctx: ToolAfterCallContext) -> None:
         return
 
     status = "success" if _tool_call_succeeded(ctx) else "fail"
-    log_path = _audit_log_path(ctx.runtime_paths.storage_root, ctx.agent_name)
-    log_path.parent.mkdir(parents=True, exist_ok=True)
     timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     line = f"{timestamp} shell {status} {host}\n"
     if _contains_github_token(line):
         msg = "agent-vault-bridge refused to write an audit line containing a GitHub token"
         raise RuntimeError(msg)
-    with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(line)
+    _append_audit_line(ctx.runtime_paths.storage_root, ctx.agent_name, line)
 
 
 def _session_token_or_decline(
@@ -239,8 +242,23 @@ def _is_gh_api_call(args: tuple[str, ...]) -> bool:
     return any(_GH_API_PATTERN.search(arg) for arg in args)
 
 
-def _audit_log_path(storage_root: Path, agent_name: str) -> Path:
-    return storage_root / "agents" / agent_name / "workspace" / AUDIT_LOG_NAME
+def _append_audit_line(storage_root: Path, agent_name: str, line: str) -> None:
+    """Append one line to the agent's audit log, raising when the log or a directory on its path is a link.
+
+    The log must be a regular file with no other hard link, as MindRoom requires of workspace files the primary writes,
+    so the append never changes a file outside the workspace. MindRoom logs a refused append as a failed hook.
+    """
+    with open_directory_within_root(storage_root, Path("agents", agent_name, "workspace"), create=True) as workspace_fd:
+        descriptor = os.open(AUDIT_LOG_NAME, _AUDIT_LOG_FLAGS, 0o666, dir_fd=workspace_fd)
+    file_status = os.fstat(descriptor)
+    hard_linked = file_status.st_nlink > 1
+    if not stat.S_ISREG(file_status.st_mode) or hard_linked:
+        os.close(descriptor)
+        reason = "has another hard link" if hard_linked else "is not a regular file"
+        msg = f"agent-vault-bridge refused to append to {AUDIT_LOG_NAME}, which {reason}"
+        raise RuntimeError(msg)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+        handle.write(line)
 
 
 def _tool_call_succeeded(ctx: ToolAfterCallContext) -> bool:
