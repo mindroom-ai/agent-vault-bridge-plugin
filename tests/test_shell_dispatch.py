@@ -54,7 +54,7 @@ def _local_shell(runtime_paths: RuntimePaths, **shell_settings: str) -> _Shell:
     toolkit = get_tool_by_name(
         "shell",
         runtime_paths,
-        disable_sandbox_proxy=True,
+        runs_in_worker=False,
         tool_config_overrides=shell_settings,
         worker_target=None,
     )
