@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from mindroom.constants import RuntimePaths
+from mindroom.config.main import Config
+from mindroom.constants import RuntimePaths, resolve_runtime_paths
 from mindroom.hooks import HookRegistry, emit_collect_environment
 from mindroom.plugin_api import ToolAfterCallContext, ToolBeforeCallContext, ToolEnvironmentContext
 
@@ -25,6 +26,10 @@ if TYPE_CHECKING:
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 _CA_PATH = "/etc/ssl/agent-vault-ca.pem"
+
+
+# The runtime paths a before-call or environment context carries; those hooks never read them.
+_RUNTIME_PATHS = resolve_runtime_paths(config_path=Path("/nonexistent/agent-vault-bridge/config.yaml"), process_env={})
 
 
 def _settings() -> hooks.VaultSettings:
@@ -57,6 +62,9 @@ async def _collect_environment(
     declined the call, if they did.
     """
     ctx = ToolEnvironmentContext(
+        config=Config(),
+        runtime_paths=_RUNTIME_PATHS,
+        correlation_id="call-environment",
         function_name=function_name,
         registered_toolkit=registered_toolkit,
         arguments=arguments,
@@ -183,6 +191,8 @@ def _before_call_context(correlation_id: str) -> ToolBeforeCallContext:
         thread_id=None,
         requester_id=None,
         session_id=None,
+        config=Config(),
+        runtime_paths=_RUNTIME_PATHS,
         correlation_id=correlation_id,
     )
 
@@ -234,6 +244,7 @@ def _after_call_context(storage_root: Path, correlation_id: str) -> ToolAfterCal
         error=None,
         blocked=False,
         duration_ms=1.0,
+        config=Config(),
         runtime_paths=runtime_paths,
         correlation_id=correlation_id,
     )
