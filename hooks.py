@@ -44,7 +44,6 @@ _DEFAULT_VAULT_SETTINGS = VaultSettings()
 
 
 _session_token: SessionToken | None = None
-_audit_host_by_correlation: dict[str, str] = {}
 
 
 def resolve_settings(raw_settings: Mapping[str, object] | None) -> VaultSettings:
@@ -104,19 +103,14 @@ async def prime_agent_vault_session(ctx: AgentLifecycleContext) -> None:
 
 @hook(EVENT_TOOL_BEFORE_CALL, name="agent-vault-bridge-before", priority=20, timeout_ms=5000)
 async def prepare_brokered_tool_call(ctx: ToolBeforeCallContext) -> None:
-    """Decline a brokered shell call when no proxy session is available, and otherwise mark it for the audit log.
+    """Decline a brokered shell call when no proxy session is available.
 
     A background script's call asks for approval after this hook, so it is refused before anyone is asked; a call in a
     reply that needs approval runs its hooks only once it is approved.
     """
     settings = resolve_settings(ctx.settings)
-    host = brokered_host_for_call(ctx.tool_name, ctx.arguments, settings)
-    if host is None:
-        return
-    if _session_token_or_decline(ctx, settings) is None:
-        return
-    if ctx.correlation_id:
-        _audit_host_by_correlation[ctx.correlation_id] = host
+    if brokered_host_for_call(ctx.tool_name, ctx.arguments, settings) is not None:
+        _session_token_or_decline(ctx, settings)
 
 
 # Its own hook, so a failure of the broker hook below can never hand a command the tokens.
@@ -150,8 +144,13 @@ async def route_brokered_shell_command(ctx: ToolEnvironmentContext) -> None:
 
 @hook(EVENT_TOOL_AFTER_CALL, name="agent-vault-bridge-after", priority=20, timeout_ms=3000)
 async def audit_brokered_tool_call(ctx: ToolAfterCallContext) -> None:
-    """Append one sanitized audit record for a brokered tool call."""
-    host = _audit_host_by_correlation.pop(ctx.correlation_id, None)
+    """Append one sanitized audit record for a brokered tool call that ran.
+
+    The host comes from the call's own arguments, since concurrent calls of one turn share its correlation id.
+    """
+    if ctx.blocked:
+        return
+    host = brokered_host_for_call(ctx.tool_name, ctx.arguments, resolve_settings(ctx.settings))
     if host is None:
         return
 
@@ -246,11 +245,7 @@ def _append_audit_line(storage_root: Path, agent_name: str, line: str) -> None:
 
 
 def _tool_call_succeeded(ctx: ToolAfterCallContext) -> bool:
-    if ctx.blocked or ctx.error is not None:
-        return False
-    if isinstance(ctx.result, str) and ctx.result.startswith("Error:"):
-        return False
-    return True
+    return ctx.error is None and not (isinstance(ctx.result, str) and ctx.result.startswith("Error:"))
 
 
 def _contains_github_token(text: str) -> bool:

@@ -11,7 +11,7 @@
 
 Route outbound API calls from [MindRoom](https://github.com/mindroom-ai/mindroom) agent shell tools through a local [Infisical Agent Vault](https://github.com/Infisical/agent-vault) so secrets never enter the agent process.
 
-The plugin gates `run_shell_command` invocations that target brokered hosts (e.g. `api.github.com`), strips known credential env vars from the subprocess, sets up a `Proxy-Authorization` session token, and proxies the call via Agent Vault. The agent sees the response but never the credential. A short audit line is appended per call: `<ISO-timestamp> shell <success|fail> <upstream-host>` — token values are never logged.
+The plugin gates `run_shell_command` invocations that target brokered hosts (e.g. `api.github.com`), strips known credential env vars from the subprocess, sets up a `Proxy-Authorization` session token, and proxies the call via Agent Vault. The agent sees the response but never the credential. A short audit line is appended per brokered call that runs: `<ISO-timestamp> shell <success|fail> <upstream-host>` — token values are never logged.
 
 ## Features
 
@@ -19,7 +19,7 @@ The plugin gates `run_shell_command` invocations that target brokered hosts (e.g
 - Strips `GITHUB_TOKEN` and `GH_TOKEN` from every shell command's environment, whether the command runs in MindRoom's process or in a worker, including values a worker's own environment or `.mindroom/worker-env.sh` provides
 - Mints short-TTL `proxy`-role session tokens from Agent Vault and supplies them via `Proxy-Authorization` to the local HTTPS proxy
 - Ships a tiny `gh-via-broker` shell wrapper that adapts `gh api <endpoint>` to the proxy + auth header convention
-- Writes a one-line audit record per brokered call to `<workspace>/agent-vault-bridge.log` (no tokens, no bodies)
+- Writes a one-line audit record per brokered call that runs to `<workspace>/agent-vault-bridge.log` (no tokens, no bodies); a declined or denied call gets none
 - Safe to hot-reload while MindRoom is running, except once when updating from a version that patched MindRoom (see Install)
 
 ## Architecture
@@ -64,10 +64,10 @@ agent receives response; agent-vault-bridge (tool:after_call) appends audit line
 | Hook | Event | Purpose |
 |------|-------|---------|
 | `prime_agent_vault_session` | `bot:ready` | Mint a long-TTL proxy session token at startup; cache and reuse |
-| `prepare_brokered_tool_call` | `tool:before_call` | Detect brokered host, mint the session token, mark the call for audit; decline when no token is available |
+| `prepare_brokered_tool_call` | `tool:before_call` | For a brokered call, mint the session token; decline when no token is available |
 | `strip_github_tokens` | `tool:environment` | Strip `GITHUB_TOKEN` and `GH_TOKEN` from every shell command |
 | `route_brokered_shell_command` | `tool:environment` | For a brokered call, refresh the session token, set proxy + token env, and put the shim directory first on `PATH`, ahead of the shell tool's `shell_path_prepend`; decline when no token is available, such as after a long approval wait |
-| `audit_brokered_tool_call` | `tool:after_call` | Append one sanitized audit line to `<agent-workspace>/agent-vault-bridge.log` |
+| `audit_brokered_tool_call` | `tool:after_call` | For a brokered call that ran, append one sanitized audit line to `<agent-workspace>/agent-vault-bridge.log` |
 
 ## Configuration
 

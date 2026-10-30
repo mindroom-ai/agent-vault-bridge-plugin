@@ -6,8 +6,12 @@ import importlib.util
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 import pytest
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = Path("/srv/mindroom/src")
@@ -44,14 +48,25 @@ from mindroom.hooks import HookRegistry, iter_module_hooks  # noqa: E402
 from agent_vault_bridge_test_import import hooks  # noqa: E402
 
 
-@pytest.fixture
-def plugin_registry() -> HookRegistry:
-    """Return a hook registry holding this plugin's hooks, as MindRoom builds it for a loaded plugin."""
+def _plugin_registry(**settings: object) -> HookRegistry:
+    """Return a hook registry holding this plugin's hooks with ``settings``, as MindRoom builds it for a loaded plugin."""
     plugin = SimpleNamespace(
         name=hooks.PLUGIN_NAME,
         discovered_hooks=tuple(iter_module_hooks(hooks)),
         discovered_automations=(),
-        entry_config=PluginEntryConfig(path="./plugins/agent-vault-bridge"),
+        entry_config=PluginEntryConfig(path="./plugins/agent-vault-bridge", settings=settings),
         plugin_order=0,
     )
     return HookRegistry.from_plugins([plugin])
+
+
+@pytest.fixture
+def plugin_registry() -> HookRegistry:
+    """Return a hook registry holding this plugin's hooks with their default settings."""
+    return _plugin_registry()
+
+
+@pytest.fixture
+def make_plugin_registry() -> Callable[..., HookRegistry]:
+    """Return a builder of hook registries holding this plugin's hooks with the settings it is given."""
+    return _plugin_registry
