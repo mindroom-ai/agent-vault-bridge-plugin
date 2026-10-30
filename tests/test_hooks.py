@@ -1,4 +1,3 @@
-# ruff: noqa: SLF001
 """Tests for the agent-vault-bridge plugin hooks."""
 
 from __future__ import annotations
@@ -174,8 +173,12 @@ async def test_github_tokens_are_stripped_even_when_the_broker_hook_fails(
     assert changes == ({"GITHUB_TOKEN": None, "GH_TOKEN": None}, (), None)
 
 
-def _before_call_context(correlation_id: str) -> ToolBeforeCallContext:
-    return ToolBeforeCallContext(
+@pytest.mark.asyncio
+async def test_before_hook_declines_brokered_call_when_no_session_can_be_minted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _vault_is_down(monkeypatch)
+    ctx = ToolBeforeCallContext(
         tool_name="run_shell_command",
         arguments={"args": ["gh", "api", "/user"]},
         agent_name="code",
@@ -183,37 +186,14 @@ def _before_call_context(correlation_id: str) -> ToolBeforeCallContext:
         thread_id=None,
         requester_id=None,
         session_id=None,
-        correlation_id=correlation_id,
     )
-
-
-@pytest.mark.asyncio
-async def test_before_hook_marks_brokered_call_for_audit(monkeypatch: pytest.MonkeyPatch) -> None:
-    _seed_token(monkeypatch)
-    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {})
-    ctx = _before_call_context("call-1")
-
-    await hooks.prepare_brokered_tool_call(ctx)
-
-    assert hooks._audit_host_by_correlation == {"call-1": "api.github.com"}
-    assert not ctx.declined
-
-
-@pytest.mark.asyncio
-async def test_before_hook_declines_brokered_call_when_no_session_can_be_minted(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _vault_is_down(monkeypatch)
-    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {})
-    ctx = _before_call_context("call-1")
 
     await hooks.prepare_brokered_tool_call(ctx)
 
     assert (ctx.declined, ctx.decline_reason) == (True, hooks.SESSION_UNAVAILABLE)
-    assert hooks._audit_host_by_correlation == {}
 
 
-def _after_call_context(storage_root: Path, correlation_id: str) -> ToolAfterCallContext:
+def _after_call_context(storage_root: Path) -> ToolAfterCallContext:
     runtime_paths = RuntimePaths(
         config_path=storage_root.parent / "config.yaml",
         config_dir=storage_root.parent,
@@ -235,19 +215,17 @@ def _after_call_context(storage_root: Path, correlation_id: str) -> ToolAfterCal
         blocked=False,
         duration_ms=1.0,
         runtime_paths=runtime_paths,
-        correlation_id=correlation_id,
     )
 
 
 @pytest.mark.asyncio
-async def test_after_hook_writes_sanitized_audit_line(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_after_hook_writes_sanitized_audit_line(tmp_path: Path) -> None:
     storage_root = tmp_path / "mindroom_data"
     storage_root.mkdir()
     log_path = storage_root / "agents" / "code" / "workspace" / hooks.AUDIT_LOG_NAME
-    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-2": "api.github.com", "call-3": "api.github.com"})
 
-    await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-2"))
-    await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-3"))
+    await hooks.audit_brokered_tool_call(_after_call_context(storage_root))
+    await hooks.audit_brokered_tool_call(_after_call_context(storage_root))
 
     lines = log_path.read_text(encoding="utf-8").splitlines(keepends=True)
     assert len(lines) == 2
@@ -256,7 +234,6 @@ async def test_after_hook_writes_sanitized_audit_line(monkeypatch: pytest.Monkey
         assert "github_pat_" not in line
         assert "ghp_" not in line
         assert "session-token" not in line
-    assert hooks._audit_host_by_correlation == {}
 
 
 def _make_workspace(storage_root: Path) -> Path:
@@ -303,7 +280,6 @@ def _link_agent_directory(storage_root: Path, outside: Path) -> None:
 )
 @pytest.mark.asyncio
 async def test_after_hook_never_appends_through_a_link_worker_code_planted(
-    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     plant_link: Callable[[Path, Path], None],
     refusal: type[Exception],
@@ -322,13 +298,11 @@ async def test_after_hook_never_appends_through_a_link_worker_code_planted(
         target.write_text("primary-owned\n", encoding="utf-8")
     plant_link(storage_root, outside)
     before = _file_contents(tmp_path)
-    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-4": "api.github.com"})
 
     with pytest.raises(refusal, match=reason):
-        await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-4"))
+        await hooks.audit_brokered_tool_call(_after_call_context(storage_root))
 
     assert _file_contents(tmp_path) == before
-    assert hooks._audit_host_by_correlation == {}
 
 
 @pytest.mark.asyncio
@@ -353,31 +327,25 @@ async def test_after_hook_refuses_a_log_swapped_for_a_link_after_the_directory_w
         return real_open(path, flags, mode, dir_fd=dir_fd)
 
     monkeypatch.setattr(os, "open", open_after_swap)
-    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-5": "api.github.com"})
 
     with pytest.raises(OSError, match=_LINK_REFUSED):
-        await hooks.audit_brokered_tool_call(_after_call_context(tmp_path / "mindroom_data", "call-5"))
+        await hooks.audit_brokered_tool_call(_after_call_context(tmp_path / "mindroom_data"))
 
     assert swapped == [log_path]
     assert log_path.is_symlink()
     assert target.read_text(encoding="utf-8") == "primary-owned\n"
-    assert hooks._audit_host_by_correlation == {}
 
 
-def test_after_hook_refuses_a_planted_fifo_without_waiting_for_a_reader(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
+def test_after_hook_refuses_a_planted_fifo_without_waiting_for_a_reader(tmp_path: Path) -> None:
     """A blocking open would stall the event loop, which the hook's timeout cannot interrupt."""
     storage_root = tmp_path / "mindroom_data"
     fifo = _make_workspace(storage_root) / hooks.AUDIT_LOG_NAME
     os.mkfifo(fifo)
-    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-6": "api.github.com"})
     refusals: list[OSError | RuntimeError] = []
 
     def run_hook() -> None:
         try:
-            asyncio.run(hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-6")))
+            asyncio.run(hooks.audit_brokered_tool_call(_after_call_context(storage_root)))
         except (OSError, RuntimeError) as refusal:
             refusals.append(refusal)
 
@@ -392,36 +360,27 @@ def test_after_hook_refuses_a_planted_fifo_without_waiting_for_a_reader(
         os.close(reader)
         pytest.fail("the audit hook blocked opening a FIFO that has no reader")
     assert [refusal.errno for refusal in refusals if isinstance(refusal, OSError)] == [errno.ENXIO]
-    assert hooks._audit_host_by_correlation == {}
 
 
 @pytest.mark.asyncio
-async def test_after_hook_writes_nothing_into_a_planted_fifo_with_a_reader(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
+async def test_after_hook_writes_nothing_into_a_planted_fifo_with_a_reader(tmp_path: Path) -> None:
     storage_root = tmp_path / "mindroom_data"
     fifo = _make_workspace(storage_root) / hooks.AUDIT_LOG_NAME
     os.mkfifo(fifo)
     reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
-    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-7": "api.github.com"})
 
     try:
         with pytest.raises(RuntimeError, match=r"which is not a regular file$"):
-            await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-7"))
+            await hooks.audit_brokered_tool_call(_after_call_context(storage_root))
         received = os.read(reader, 4096)
     finally:
         os.close(reader)
 
     assert received == b""
-    assert hooks._audit_host_by_correlation == {}
 
 
 @pytest.mark.asyncio
-async def test_after_hook_appends_again_once_a_planted_link_is_removed(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
+async def test_after_hook_appends_again_once_a_planted_link_is_removed(tmp_path: Path) -> None:
     storage_root = tmp_path / "mindroom_data"
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -429,13 +388,11 @@ async def test_after_hook_appends_again_once_a_planted_link_is_removed(
     target.write_text("primary-owned\n", encoding="utf-8")
     _link_audit_log(storage_root, outside)
     log_path = storage_root / "agents" / "code" / "workspace" / hooks.AUDIT_LOG_NAME
-    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {"call-8": "api.github.com", "call-9": "api.github.com"})
 
     with pytest.raises(OSError, match=_LINK_REFUSED):
-        await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-8"))
+        await hooks.audit_brokered_tool_call(_after_call_context(storage_root))
     log_path.unlink()
-    await hooks.audit_brokered_tool_call(_after_call_context(storage_root, "call-9"))
+    await hooks.audit_brokered_tool_call(_after_call_context(storage_root))
 
     assert re.fullmatch(r"\S+ shell success api\.github\.com\n", log_path.read_text(encoding="utf-8"))
     assert target.read_text(encoding="utf-8") == "primary-owned\n"
-    assert hooks._audit_host_by_correlation == {}
