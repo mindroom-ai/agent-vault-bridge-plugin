@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from contextlib import nullcontext
@@ -13,6 +14,7 @@ from mindroom.approval.tool_approval import BackgroundScriptToolOrigin, ToolAppr
 from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
 from mindroom.hooks import HookBindings, HookRegistry
+from mindroom.llm.request_context import bind_llm_request_log_context
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
 from mindroom.tool_system.metadata import get_tool_by_name
 from mindroom.tool_system.registry import builtin_tool_registry
@@ -91,9 +93,8 @@ def make_shell(
 
 @pytest.fixture(autouse=True)
 def session(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Start every test with a valid proxy session and no audit marks."""
+    """Start every test with a valid proxy session."""
     monkeypatch.setattr(hooks, "_session_token", SessionToken(value="session-token", expires_at=time.time() + 600))
-    monkeypatch.setattr(hooks, "_audit_host_by_correlation", {})
 
 
 async def _call(
@@ -104,7 +105,20 @@ async def _call(
     *,
     approval_gate: _ApprovalGate | None = None,
 ) -> ToolOutcome:
-    """Run ``command`` as one shell call, through ``approval_gate`` as a background script's call when given.
+    """Run ``command`` as one shell call, through ``approval_gate`` as a background script's call when given."""
+    (outcome,) = await _calls(shell, registry, [command], runtime_paths, approval_gate=approval_gate)
+    return outcome
+
+
+async def _calls(
+    shell: _Shell,
+    registry: HookRegistry,
+    commands: list[str],
+    runtime_paths: RuntimePaths,
+    *,
+    approval_gate: _ApprovalGate | None = None,
+) -> list[ToolOutcome]:
+    """Run each of ``commands`` as one shell call, all at once, through ``approval_gate`` when given.
 
     Fail when any hook fails, since MindRoom only logs a failing observer hook such as the audit.
     """
@@ -127,15 +141,20 @@ async def _call(
         origin=origin,
         approval_gate=approval_gate,
     )
-    with shell.runtime(), detached_tool_scope(identity), structlog.testing.capture_logs() as logs:
-        outcome = await execute_tool_call(
-            shell.function,
-            {"args": ["bash", "-c", command]},
-            ToolCallContext(run_id="run-1", session_id=identity.session_id, user_id=None),
-            middleware=(policy,),
-        )
+
+    async def call(command: str) -> ToolOutcome:
+        with shell.runtime(), detached_tool_scope(identity):
+            return await execute_tool_call(
+                shell.function,
+                {"args": ["bash", "-c", command]},
+                ToolCallContext(run_id="run-1", session_id=identity.session_id, user_id=None),
+                middleware=(policy,),
+            )
+
+    with structlog.testing.capture_logs() as logs:
+        outcomes = await asyncio.gather(*(call(command) for command in commands))
     assert [log for log in logs if log["event"] == "Hook execution failed"] == []
-    return outcome
+    return outcomes
 
 
 async def _run(shell: _Shell, registry: HookRegistry, command: str, runtime_paths: RuntimePaths) -> str:
@@ -221,7 +240,7 @@ async def test_a_session_that_cannot_be_refreshed_after_approval_declines_the_co
     """The session expires while the call waits for approval and Agent Vault cannot mint a new one.
 
     The call is refused with the plugin's reason instead of running without the proxy: the command never runs, no
-    worker request is sent, and the audit log records the call as failed.
+    worker request is sent, and the audit log records nothing, since no call went through the proxy.
     """
     shell = make_shell(shell_path_prepend=str(configured_bin))
     marker = tmp_path / "command-ran"
@@ -255,4 +274,44 @@ async def test_a_session_that_cannot_be_refreshed_after_approval_declines_the_co
     assert f"\nReason: {hooks.SESSION_UNAVAILABLE}\n" in outcome.content
     assert not marker.exists()
     assert shell.sent == []
-    assert _audit_records(runtime_paths) == ["shell fail api.github.com"]
+    assert _audit_records(runtime_paths) == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_brokered_calls_of_one_turn_each_record_their_own_host(
+    make_shell: Callable[..., _Shell],
+    make_plugin_registry: Callable[..., HookRegistry],
+    configured_bin: Path,
+    runtime_paths: RuntimePaths,
+    tmp_path: Path,
+) -> None:
+    """Two brokered calls of one turn share its correlation id, and each one's audit line still names its own host.
+
+    The first command waits until the second has started, so both calls have run their hooks before either finishes.
+    """
+    shell = make_shell(shell_path_prepend=str(configured_bin))
+    registry = make_plugin_registry(brokered_hosts=["api.github.com", "uploads.github.com"])
+    second_started = tmp_path / "second-started"
+    os.mkfifo(second_started)
+    # Held open by the test, so neither command blocks opening the FIFO and the signal waits until it is read.
+    held = os.open(second_started, os.O_RDWR)
+    try:
+        with bind_llm_request_log_context(correlation_id="turn-1"):
+            first, second = await _calls(
+                shell,
+                registry,
+                [
+                    f"read -r -t 20 _ < {second_started} || exit 1; gh api /user",
+                    f"echo started > {second_started}; curl https://uploads.github.com/repos",
+                ],
+                runtime_paths,
+            )
+    finally:
+        os.close(held)
+
+    assert not first.is_error, first.content
+    assert not second.is_error, second.content
+    assert sorted(_audit_records(runtime_paths)) == [
+        "shell success api.github.com",
+        "shell success uploads.github.com",
+    ]
