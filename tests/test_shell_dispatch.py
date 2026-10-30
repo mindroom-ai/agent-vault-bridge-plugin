@@ -11,12 +11,14 @@ from typing import TYPE_CHECKING
 import pytest
 import structlog
 from mindroom.approval.tool_approval import BackgroundScriptToolOrigin, ToolApprovalDecision
+from mindroom.config.main import Config
 from mindroom.constants import resolve_runtime_paths
-from mindroom.hooks import HookRegistry
+from mindroom.hooks import HookBindings, HookRegistry
 from mindroom.llm.request_context import bind_llm_request_log_context
 from mindroom.tool_system.invocation import ToolCallContext, execute_tool_call
 from mindroom.tool_system.metadata import get_tool_by_name
-from mindroom.tool_system.runtime_context import ToolDispatchContext
+from mindroom.tool_system.registry import builtin_tool_registry
+from mindroom.tool_system.runtime_context import detached_tool_scope
 from mindroom.tool_system.tool_hooks import build_tool_hook_middleware
 from tests.test_sandbox_proxy import _MIND_EXECUTION_IDENTITY
 from tests.test_tool_environment_hook import _function, _Shell, _worker_tool
@@ -59,6 +61,7 @@ def _local_shell(runtime_paths: RuntimePaths, **shell_settings: str) -> _Shell:
         runs_in_worker=False,
         tool_config_overrides=shell_settings,
         worker_target=None,
+        tools=builtin_tool_registry(),
     )
     return _Shell(_function(toolkit, "shell", "run_shell_command"), sent=[], runtime=nullcontext)
 
@@ -132,17 +135,15 @@ async def _calls(
         )
     )
     policy = build_tool_hook_middleware(
-        registry,
-        agent_name="mind",
-        dispatch_context=ToolDispatchContext(execution_identity=identity),
-        config=None,
-        runtime_paths=runtime_paths,
+        HookBindings(registry=registry),
+        Config(),
+        runtime_paths,
         origin=origin,
         approval_gate=approval_gate,
     )
 
     async def call(command: str) -> ToolOutcome:
-        with shell.runtime():
+        with shell.runtime(), detached_tool_scope(identity):
             return await execute_tool_call(
                 shell.function,
                 {"args": ["bash", "-c", command]},
